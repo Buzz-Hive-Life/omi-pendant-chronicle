@@ -387,14 +387,19 @@ class PendantForegroundService : LifecycleService() {
                 nextAutoStorageSyncAt = System.currentTimeMillis() + delayMs
                 delay(delayMs)
                 val requested = requestAutomaticStorageSyncIfIdle()
-                delayMs = if (requested) {
-                    if ((ble.settingsTelemetry.value?.sdBacklog ?: 0L) > 0L) {
+                // ⚠️ KEYED ON THE APP'S OWN STATE, NOT ON A PENDANT READING.
+                // `sdBacklog` comes FROM the pendant, so once the link drops there is nothing to report and
+                // an INCOMPLETE transfer fell through to the hourly interval — while the pendant is only
+                // awake for ~10 s. *A value downstream of the thing it describes cannot decide that thing.*
+                // `ble.isTransferPending` is the app's own knowledge and survives the drop.
+                val pending = try { ble.isTransferPending } catch (t: Throwable) { false }
+                delayMs = when {
+                    // a transfer that started and did NOT finish: come back in SECONDS, inside the awake window
+                    pending -> AUTO_STORAGE_SYNC_PENDING_RETRY_MS
+                    requested && (ble.settingsTelemetry.value?.sdBacklog ?: 0L) > 0L ->
                         AUTO_STORAGE_SYNC_BACKLOG_INTERVAL_MS
-                    } else {
-                        AUTO_STORAGE_SYNC_INTERVAL_MS
-                    }
-                } else {
-                    AUTO_STORAGE_SYNC_RETRY_MS
+                    requested -> AUTO_STORAGE_SYNC_INTERVAL_MS
+                    else -> AUTO_STORAGE_SYNC_RETRY_MS
                 }
             }
         }
@@ -792,6 +797,10 @@ class PendantForegroundService : LifecycleService() {
         private const val AUTO_STORAGE_SYNC_BACKLOG_INTERVAL_MS = 5L * 60L * 1000L
         private const val AUTO_STORAGE_SYNC_INTERVAL_MS = 60L * 60L * 1000L
         private const val AUTO_STORAGE_SYNC_RETRY_MS = 2L * 60L * 1000L
+        // ⚠️ AN INCOMPLETE TRANSFER RETRIES FAST — and this is the fix for the founder's dropped drains.
+        // The pendant advertises for roughly TEN SECONDS; the previous fall-through was the HOURLY interval,
+        // so a dropped transfer was abandoned until the next hour. Ten seconds, honestly, beats an hour.
+        private const val AUTO_STORAGE_SYNC_PENDING_RETRY_MS = 8L * 1000L
 
         const val ACTION_RUN_BACKFILL = "com.connor.pendant.action.RUN_BACKFILL"
         const val ACTION_SYNC_NOW = "com.connor.pendant.action.SYNC_NOW"

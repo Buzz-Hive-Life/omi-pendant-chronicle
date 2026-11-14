@@ -266,6 +266,14 @@ class OmiBleClient(private val context: Context) {
         private set
 
     private var pendingStorageSync = false
+
+    /**
+     * ⚠️ THE APP'S OWN answer to "is a transfer unfinished?", exposed so the sync loop can key its retry
+     * interval on it. `pendingStorageSync` survives a drop (it is cleared only on completion); a reading
+     * taken FROM the pendant does not, which is exactly why the old code fell through to an hourly wait.
+     */
+    val isTransferPending: Boolean
+        get() = pendingStorageSync
     private var pendingStorageStatsRead = false
     private var storageStatsDisconnectAfterRead = false
     private var storageStatsProofStep = 0
