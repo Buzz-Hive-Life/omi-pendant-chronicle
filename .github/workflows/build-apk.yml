@@ -24,10 +24,16 @@ jobs:
         run: |
           # local.properties is git-ignored; CI writes it from repository secrets so the URL and the pipe
           # secret never live in the tree. ⚠️ The secret IS embedded in the APK — that is the app's design.
+          # ⚠️ A MISSING SECRET MUST NOT FAIL THE BUILD — it must build and be DIAGNOSABLE. An APK with an
+          # empty secret authenticates as nobody, and the pipe answers 403 with a named refusal, which is a
+          # far better symptom than a mysterious build failure.
           {
             echo "agent.url=https://omi-ingest-production.up.railway.app/raw"
             echo "pendant.secret=${{ secrets.OMI_PIPE_SECRET }}"
           } > local.properties
+          if [ -z "${{ secrets.OMI_PIPE_SECRET }}" ]; then
+            echo "::warning title=No pipe secret::OMI_PIPE_SECRET is unset — this APK WILL build but the pipe will refuse its posts (403). Add the secret and re-run."
+          fi
 
       - name: Build
         working-directory: android-app
