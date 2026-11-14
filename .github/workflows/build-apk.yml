@@ -38,9 +38,9 @@ jobs:
       - name: Build
         working-directory: android-app
         run: |
-          # gradlew may be absent in the upstream tree; bootstrap a wrapper if needed
+          # the tree now carries a wrapper pinned to 8.9; bootstrap only if it is somehow missing
           if [ ! -x ./gradlew ]; then
-            gradle wrapper --gradle-version 8.7 || true
+            gradle wrapper --gradle-version 8.9 || true
           fi
           ./gradlew --no-daemon assembleDebug
 
