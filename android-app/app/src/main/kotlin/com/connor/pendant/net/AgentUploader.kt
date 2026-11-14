@@ -33,7 +33,12 @@ class AgentUploader(
         // reference (400 consent_ref_required) — the fence's rule 3 is class-independent, so without
         // one, rule 5 (class S + lawful ref ⇒ HOLD) is unreachable and the text is derived and DROPPED.
         // Must name the wearer and the day: `self.<yyyy-MM-dd>` = the wearer recording their own voice.
-        private val consentRef: String
+        private val consentRef: String,
+        // ⚠️ THE SESSION CLASS — a DECLARATION, immutable per session, and REFUSED if absent
+        // ('no deploy-level class default; blank/absent must refuse, never default').
+        // `S` = the wearer's own voice, and the only class currently holdable. `R` is blocked behind
+        // the legal annex, so it is not offered here as a choice.
+        private val sessionClass: String
 ) {
     private val tag = "AgentUploader"
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -82,6 +87,7 @@ class AgentUploader(
             val resp = client.post(forceUrl) {
                 header("X-Pendant-Secret", secret)
                     header("X-Consent-Ref", consentRef)
+                    header("X-Session-Class", sessionClass)
             }
             resp.status.value in 200..299
         } catch (t: Throwable) {
@@ -142,6 +148,7 @@ class AgentUploader(
                 client.post(batchUrl) {
                     header("X-Pendant-Secret", secret)
                     header("X-Consent-Ref", consentRef)
+                    header("X-Session-Class", sessionClass)
                     header("X-Pendant-Batch", "length-prefixed-v1")
                     if (startedAtMs != null) {
                         header("X-Pendant-Session-Start", startedAtMs.toString())
@@ -208,6 +215,7 @@ class AgentUploader(
         client.post(url) {
             header("X-Pendant-Secret", secret)
                     header("X-Consent-Ref", consentRef)
+                    header("X-Session-Class", sessionClass)
             if (startedAtMs != null) {
                 header("X-Pendant-Session-Start", startedAtMs.toString())
             }
