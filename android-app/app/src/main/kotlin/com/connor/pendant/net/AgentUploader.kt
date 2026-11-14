@@ -28,7 +28,12 @@ import java.util.concurrent.atomic.AtomicLong
  */
 class AgentUploader(
     private val url: String,
-    private val secret: String
+    private val secret: String,
+        // ⚠️ A DECLARATION WITH LEGAL EFFECT, not a formality. The pipe refuses a capture with no
+        // reference (400 consent_ref_required) — the fence's rule 3 is class-independent, so without
+        // one, rule 5 (class S + lawful ref ⇒ HOLD) is unreachable and the text is derived and DROPPED.
+        // Must name the wearer and the day: `self.<yyyy-MM-dd>` = the wearer recording their own voice.
+        private val consentRef: String
 ) {
     private val tag = "AgentUploader"
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -76,7 +81,7 @@ class AgentUploader(
         return try {
             val resp = client.post(forceUrl) {
                 header("X-Pendant-Secret", secret)
-                header("X-Consent-Ref", consentRef)
+                    header("X-Consent-Ref", consentRef)
             }
             resp.status.value in 200..299
         } catch (t: Throwable) {
@@ -136,7 +141,7 @@ class AgentUploader(
             } else {
                 client.post(batchUrl) {
                     header("X-Pendant-Secret", secret)
-                header("X-Consent-Ref", consentRef)
+                    header("X-Consent-Ref", consentRef)
                     header("X-Pendant-Batch", "length-prefixed-v1")
                     if (startedAtMs != null) {
                         header("X-Pendant-Session-Start", startedAtMs.toString())
@@ -202,7 +207,7 @@ class AgentUploader(
     private suspend fun postSingle(frame: ByteArray, startedAtMs: Long? = null) =
         client.post(url) {
             header("X-Pendant-Secret", secret)
-                header("X-Consent-Ref", consentRef)
+                    header("X-Consent-Ref", consentRef)
             if (startedAtMs != null) {
                 header("X-Pendant-Session-Start", startedAtMs.toString())
             }
