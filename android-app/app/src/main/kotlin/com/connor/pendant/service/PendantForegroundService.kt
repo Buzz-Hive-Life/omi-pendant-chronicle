@@ -245,7 +245,8 @@ class PendantForegroundService : LifecycleService() {
                     val stats = HealthConnectBackfill(
                         context = applicationContext,
                         agentUrl = BuildConfig.AGENT_URL,
-                        secret = PipeSecret.get(this),
+                        // ⚠️ `this` here is the CoroutineScope from launch { }, not a Context
+                        secret = PipeSecret.get(applicationContext),
                         daysBack = days,
                     ).run()
                     Log.i(tag, "backfill complete: $stats")
