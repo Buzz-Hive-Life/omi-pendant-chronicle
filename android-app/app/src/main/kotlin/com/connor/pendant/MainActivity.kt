@@ -1,5 +1,7 @@
 package com.connor.pendant
 
+import com.connor.pendant.BuildConfig
+
 import com.connor.pendant.net.PipeSecret
 
 import android.Manifest
@@ -2662,6 +2664,7 @@ class MainActivity : AppCompatActivity() {
         val ble = service?.bleClient
         val wrap = sheetContainer()
         wrap.addView(meta("Settings"))
+        wrap.addView(bodyText("App version: " + BuildConfig.HIVE_VERSION))
         wrap.addView(cardTitle("Pendant service"))
         wrap.addView(bodyText("Low-power mode keeps BLE and audio-out idle until you sync or start live mode."))
         wrap.addView(bodyText("BLE: ${ble?.state?.value?.name ?: "idle"} | Frames: ${ble?.frameCount() ?: 0}"))

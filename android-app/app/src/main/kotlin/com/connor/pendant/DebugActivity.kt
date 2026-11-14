@@ -1,5 +1,7 @@
 package com.connor.pendant
 
+import com.connor.pendant.BuildConfig
+
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
@@ -82,6 +84,7 @@ class DebugActivity : AppCompatActivity() {
         val up = svc.agentUploader
         val st = storeStatus
         val sb = StringBuilder()
+        sb.append("App:       ").append(BuildConfig.HIVE_VERSION).append('\n')
         sb.append("Live mode: ").append(if (svc.isLiveMode) "on" else "off").append('\n')
         sb.append("BLE state: ").append(ble?.state?.value ?: "—").append('\n')
         sb.append("Device:    ").append(ble?.deviceAddr ?: "(none yet — scanning)").append('\n')
