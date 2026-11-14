@@ -25,7 +25,7 @@ android {
         buildConfigField(
             "String",
             "AGENT_URL",
-            "\"${localProps.getProperty("agent.url", "http://agent:8773/raw")}\""
+            "\"${localProps.getProperty("agent.url", "https://omi-ingest-production.up.railway.app/raw")}\""
         )
         buildConfigField(
             "String",

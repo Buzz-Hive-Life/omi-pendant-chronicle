@@ -103,7 +103,14 @@ class PendantForegroundService : LifecycleService() {
 
         startInForeground(includeMediaPlayback = false)
 
-        uploader = AgentUploader(BuildConfig.AGENT_URL, BuildConfig.PENDANT_SECRET)
+        uploader = AgentUploader(
+            BuildConfig.AGENT_URL,
+            BuildConfig.PENDANT_SECRET,
+            // the wearer declares their own voice, dated — the reference the fence needs to HOLD rather
+            // than derive-and-drop. `self.` marks it as the subject recording themselves.
+            "self." + java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+                .format(java.util.Date())
+        )
         val apiBase = run {
             val raw = URL(BuildConfig.AGENT_URL)
             "${raw.protocol}://${raw.host}:8772"

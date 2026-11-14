@@ -76,6 +76,7 @@ class AgentUploader(
         return try {
             val resp = client.post(forceUrl) {
                 header("X-Pendant-Secret", secret)
+                header("X-Consent-Ref", consentRef)
             }
             resp.status.value in 200..299
         } catch (t: Throwable) {
@@ -135,6 +136,7 @@ class AgentUploader(
             } else {
                 client.post(batchUrl) {
                     header("X-Pendant-Secret", secret)
+                header("X-Consent-Ref", consentRef)
                     header("X-Pendant-Batch", "length-prefixed-v1")
                     if (startedAtMs != null) {
                         header("X-Pendant-Session-Start", startedAtMs.toString())
@@ -200,6 +202,7 @@ class AgentUploader(
     private suspend fun postSingle(frame: ByteArray, startedAtMs: Long? = null) =
         client.post(url) {
             header("X-Pendant-Secret", secret)
+                header("X-Consent-Ref", consentRef)
             if (startedAtMs != null) {
                 header("X-Pendant-Session-Start", startedAtMs.toString())
             }

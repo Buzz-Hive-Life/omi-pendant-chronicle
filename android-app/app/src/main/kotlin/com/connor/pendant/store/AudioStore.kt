@@ -448,7 +448,11 @@ class AudioStore(
         private const val OPUS_FRAME_DURATION_MS = 20L
         private val STORAGE_FRAME_MAGIC = byteArrayOf(0x4F, 0x4D, 0x49, 0x46, 0x52, 0x31) // OMIFR1
         private const val STORAGE_FRAME_VERSION = 1
-        private const val OMI_FRAME_HEADER_BYTES = 3
+        // ⚠️ MEASURED, NOT ASSUMED. The LIVE stream carries a 3-byte header; the STORED RING RECORD carries
+        // **5** — resolved on a real drain by scoring candidates for CLIPPING, because `decoded > 0` and
+        // "most frames decoded" both report success on a desynchronised read (Opus decodes noise happily,
+        // pinning the waveform at full scale). A 3-byte read of a 5-byte record shifts every packet.
+        private const val OMI_FRAME_HEADER_BYTES = 5
         private const val MAX_LEGACY_FRAME_BYTES = 160
         private const val MAX_REPLAY_FRAMES = 250_000
         private const val MAX_REPLAY_FRAME_BYTES = 1024

@@ -1,0 +1,46 @@
+name: Build pendant APK
+
+# ⚠️ WHY THIS FILE EXISTS: the fork cannot be compiled where it was written — no JDK, no Gradle, no Android
+# SDK. GitHub's runners have the Android SDK; this turns "here is a patch" into "here is an installable APK".
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ hive ]
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Configure the Hive sink
+        working-directory: android-app
+        run: |
+          # local.properties is git-ignored; CI writes it from repository secrets so the URL and the pipe
+          # secret never live in the tree. ⚠️ The secret IS embedded in the APK — that is the app's design.
+          {
+            echo "agent.url=https://omi-ingest-production.up.railway.app/raw"
+            echo "pendant.secret=${{ secrets.OMI_PIPE_SECRET }}"
+          } > local.properties
+
+      - name: Build
+        working-directory: android-app
+        run: |
+          # gradlew may be absent in the upstream tree; bootstrap a wrapper if needed
+          if [ ! -x ./gradlew ]; then
+            gradle wrapper --gradle-version 8.7 || true
+          fi
+          ./gradlew --no-daemon assembleDebug
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: pendant-debug-apk
+          path: android-app/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
