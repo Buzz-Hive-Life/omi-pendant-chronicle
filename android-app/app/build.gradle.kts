@@ -12,6 +12,19 @@ val localProps = Properties().apply {
 }
 
 android {
+    signingConfigs {
+        create("hive") {
+            // ⚠️ CI generates this keystore per-run and NEVER stores it. A throwaway key is the right shape
+            // for a personal build: nothing to leak, nothing to rotate.
+            val ks = System.getenv("HIVE_KEYSTORE") ?: "${rootDir}/hive-release.jks"
+            storeFile = file(ks)
+            storePassword = System.getenv("HIVE_KS_PASS") ?: "hivepass"
+            keyAlias = System.getenv("HIVE_KEY_ALIAS") ?: "hive"
+            keyPassword = System.getenv("HIVE_KEY_PASS") ?: "hivepass"
+        }
+    }
+
+
     namespace = "com.connor.pendant"
     compileSdk = 35
 
@@ -63,6 +76,17 @@ android {
         buildConfig = true
         viewBinding = true
     }
+
+    buildTypes {
+        getByName("release") {
+            // the whole point: R8 strips what is unused, which is most of the 27 MB
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.getByName("hive")
+        }
+    }
+
 }
 
 dependencies {

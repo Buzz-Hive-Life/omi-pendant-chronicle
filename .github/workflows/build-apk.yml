@@ -35,18 +35,32 @@ jobs:
             echo "::warning title=No pipe secret::OMI_PIPE_SECRET is unset — this APK WILL build but the pipe will refuse its posts (403). Add the secret and re-run."
           fi
 
+      - name: Generate a throwaway signing key
+        run: |
+          # ⚠️ Exists only for this job. Never stored, never committed. A release APK must be SIGNED to be
+          # installable, and a personal build needs an installable artifact, not a distributable identity.
+          keytool -genkeypair -v -keystore "$GITHUB_WORKSPACE/hive-release.jks" \
+            -alias hive -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass hivepass -keypass hivepass \
+            -dname "CN=Hive Pendant, OU=Hive Life Haven, O=Hive, L=Riverview, ST=NB, C=CA"
+
       - name: Build
         working-directory: android-app
+        env:
+          HIVE_KEYSTORE: ${{ github.workspace }}/hive-release.jks
+          HIVE_KS_PASS: hivepass
+          HIVE_KEY_PASS: hivepass
         run: |
-          # the tree now carries a wrapper pinned to 8.9; bootstrap only if it is somehow missing
           if [ ! -x ./gradlew ]; then
             gradle wrapper --gradle-version 8.9 || true
           fi
-          ./gradlew --no-daemon assembleDebug
+          # release is the small, installable one (R8 strips the bulk); debug stays for diagnosing
+          ./gradlew --no-daemon assembleRelease
+          ./gradlew --no-daemon assembleDebug || true
 
       - name: Upload the APK
         uses: actions/upload-artifact@v4
         with:
-          name: pendant-debug-apk
+          name: pendant-apk
           path: android-app/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
