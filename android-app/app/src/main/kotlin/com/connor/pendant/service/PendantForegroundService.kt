@@ -164,6 +164,16 @@ class PendantForegroundService : LifecycleService() {
                 }
                 if (!sync.active && storageSyncHasRun) {
                     requestPendingAudioReplay("storage sync complete")
+                    if (sync.lastError == null) {
+                        // ⚠️ THE ONLY PLACE THE INCOMPLETE FLAG IS CLEARED. A FAILURE (lastError != null)
+                        // deliberately leaves it set, so the sync loop keeps retrying in seconds — which is
+                        // the whole fix. Clearing it on a failure would make this inert, which is exactly
+                        // what the previous attempt did by keying on the client's flag.
+                        if (storageSyncIncomplete) {
+                            Log.i(tag, "Storage sync COMPLETED — clearing the incomplete flag")
+                        }
+                        storageSyncIncomplete = false
+                    }
                     if (sync.lastError == null && !liveMode && !ble.storageStats.value.active && !ble.storageStats.value.proofActive) {
                         Log.i(tag, "Storage sync complete — arming button watch")
                         armButton()
@@ -392,7 +402,10 @@ class PendantForegroundService : LifecycleService() {
                 // an INCOMPLETE transfer fell through to the hourly interval — while the pendant is only
                 // awake for ~10 s. *A value downstream of the thing it describes cannot decide that thing.*
                 // `ble.isTransferPending` is the app's own knowledge and survives the drop.
-                val pending = try { ble.isTransferPending } catch (t: Throwable) { false }
+                // ⚠️ THE SERVICE'S FLAG. The client's `pendingStorageSync` is cleared BY the disconnect
+                // handler, so keying on it was inert by construction. THIS one is cleared only on a clean
+                // completion, so an interrupted transfer keeps the fast retry alive.
+                val pending = storageSyncIncomplete
                 delayMs = when {
                     // a transfer that started and did NOT finish: come back in SECONDS, inside the awake window
                     pending -> AUTO_STORAGE_SYNC_PENDING_RETRY_MS
@@ -427,6 +440,15 @@ class PendantForegroundService : LifecycleService() {
         }
     }
 
+    /**
+     * ⚠️ THE FACT THAT SURVIVES A DROP — set when a sync is REQUESTED, cleared ONLY on a CLEAN completion.
+     *
+     * `ble.pendingStorageSync` cannot serve here: the disconnect handler sets it false, and so does
+     * `completeStorageSync(error)` — so it reads false exactly when a transfer has been interrupted, which is
+     * when the retry needs it most. This flag is owned by the service and the connection cannot clear it.
+     */
+    @Volatile private var storageSyncIncomplete: Boolean = false
+
     private fun requestAutomaticStorageSyncIfIdle(): Boolean {
         if (!::ble.isInitialized) return skipAutomaticStorageSync("BLE not initialized")
         val sync = ble.storageSync.value
@@ -439,7 +461,8 @@ class PendantForegroundService : LifecycleService() {
             else -> {
                 lastAutoStorageSyncRequestedAt = System.currentTimeMillis()
                 lastAutoStorageSyncSkipReason = null
-                requestStorageSync("Automatic hourly")
+                storageSyncIncomplete = true
+                    requestStorageSync("Automatic hourly")
                 true
             }
         }
