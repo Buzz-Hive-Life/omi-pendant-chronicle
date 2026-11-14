@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import com.connor.pendant.net.PipeSecret
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.PowerManager
@@ -105,7 +106,7 @@ class PendantForegroundService : LifecycleService() {
 
         uploader = AgentUploader(
             BuildConfig.AGENT_URL,
-            BuildConfig.PENDANT_SECRET,
+            PipeSecret.get(this),
             // the wearer declares their own voice, dated — the reference the fence needs to HOLD rather
             // than derive-and-drop. `self.` marks it as the subject recording themselves.
             "self." + java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
@@ -122,7 +123,7 @@ class PendantForegroundService : LifecycleService() {
             val port = if (raw.port > 0) ":${raw.port}" else ""
             "$scheme://${raw.host}$port"
         }
-        api = ChronicleApi(apiBase, audioOutHttpBase, BuildConfig.PENDANT_SECRET)
+        api = ChronicleApi(apiBase, audioOutHttpBase, PipeSecret.get(this))
         store = AudioStore(this)
         ble = OmiBleClient(this)
         ble.setStorageFileSafetyCheckpoint { payload ->
@@ -210,7 +211,7 @@ class PendantForegroundService : LifecycleService() {
         // biometrics (HR / steps / sleep / distance / calories / SpO2) merged under "health".
         contextCollector = ContextCollector(this)
         contextCollector.start()
-        heartbeat = HeartbeatPoster(BuildConfig.AGENT_URL, BuildConfig.PENDANT_SECRET)
+        heartbeat = HeartbeatPoster(BuildConfig.AGENT_URL, PipeSecret.get(this))
         healthReader = HealthConnectReader(applicationContext)
         lifecycleScope.launch {
             // Initial delay so we don't hammer the agent at boot before perms are granted.
@@ -244,7 +245,7 @@ class PendantForegroundService : LifecycleService() {
                     val stats = HealthConnectBackfill(
                         context = applicationContext,
                         agentUrl = BuildConfig.AGENT_URL,
-                        secret = BuildConfig.PENDANT_SECRET,
+                        secret = PipeSecret.get(this),
                         daysBack = days,
                     ).run()
                     Log.i(tag, "backfill complete: $stats")
@@ -713,7 +714,7 @@ class PendantForegroundService : LifecycleService() {
 
     private fun startAudioOut() {
         if (audioOutClient != null || audioOutPlayer != null) return
-        val client = AudioOutClient(BuildConfig.AUDIO_OUT_WS_URL, BuildConfig.PENDANT_SECRET)
+        val client = AudioOutClient(BuildConfig.AUDIO_OUT_WS_URL, PipeSecret.get(this))
         val player = AudioOutPlayer(this)
         audioOutClient = client
         audioOutPlayer = player

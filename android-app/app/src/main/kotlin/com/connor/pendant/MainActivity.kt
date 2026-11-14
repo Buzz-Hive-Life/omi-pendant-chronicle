@@ -1,5 +1,7 @@
 package com.connor.pendant
 
+import com.connor.pendant.net.PipeSecret
+
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -2622,6 +2624,39 @@ class MainActivity : AppCompatActivity() {
         return ScrollView(this).apply { addView(wrap) }
     }
 
+    /** Type the pipe secret once. Stored on the DEVICE; the APK never carries it. */
+    private fun showPipeSecretSheet() {
+        val wrap = sheetContainer()
+        wrap.addView(meta("Hive"))
+        wrap.addView(cardTitle("Pipeline secret"))
+        wrap.addView(bodyText("Paste the secret the Hive pipeline expects. Railway → omi-ingest → Variables → OMI_INGEST_WEBHOOK_SECRET. It is kept on THIS phone only — never in the app, so a shared app file carries no credential."))
+        wrap.addView(bodyText("Stored: " + if (PipeSecret.isSet(this)) "yes (" + PipeSecret.source(this) + ")" else "no — the pipeline will refuse uploads (403)"))
+        val input = EditText(this).apply {
+            hint = "pipeline secret"
+            setText(PipeSecret.get(this@MainActivity))
+            setSingleLine(true)
+        }
+        wrap.addView(input)
+
+        val sheet = BottomSheetDialog(this)
+        wrap.addView(scrollButtonRow {
+            addView(pillButton("Save", Variant.PRIMARY) {
+                PipeSecret.set(this@MainActivity, input.text.toString())
+                toast(if (PipeSecret.isSet(this@MainActivity)) "Hive secret saved." else "Secret was blank — nothing saved.")
+                sheet.dismiss()
+                renderContent()
+            })
+            addView(pillButton("Clear", Variant.DANGER) {
+                PipeSecret.set(this@MainActivity, "")
+                toast("Hive secret cleared.")
+                sheet.dismiss()
+                renderContent()
+            })
+        })
+        sheet.setContentView(ScrollView(this).apply { addView(wrap) })
+        sheet.show()
+    }
+
     private fun showSettingsSheet() {
         val service = PendantForegroundService.instance
         val ble = service?.bleClient
@@ -2643,6 +2678,15 @@ class MainActivity : AppCompatActivity() {
         wrap.addView(scrollButtonRow {
             addView(pillButton("Privacy", Variant.QUIET) { showPrivacySheet() })
         })
+            // ⚠️ THE PIPE SECRET LIVES ON THE DEVICE, NOT IN THE APK. Without one the pipe answers
+            // `403 unauthorized` — a NAMED refusal, which is why the status is shown right here.
+            wrap.addView(scrollButtonRow {
+                addView(pillButton(
+                    if (PipeSecret.isSet(this@MainActivity)) "Hive secret ✓ (${PipeSecret.source(this@MainActivity)})"
+                    else "Set Hive secret ⚠",
+                    if (PipeSecret.isSet(this@MainActivity)) Variant.QUIET else Variant.PRIMARY
+                ) { showPipeSecretSheet() })
+            })
         wrap.addView(scrollButtonRow {
             addView(pillButton("Auto", Variant.QUIET) { setTranslationMode("auto") })
             addView(pillButton("On", Variant.TRANSLATE) { setTranslationMode("on") })
