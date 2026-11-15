@@ -63,9 +63,12 @@ object OmiUuids {
     val BATTERY_SERVICE: UUID = UUID.fromString("0000180F-0000-1000-8000-00805F9B34FB")
     val BATTERY_LEVEL_CHAR: UUID = UUID.fromString("00002A19-0000-1000-8000-00805F9B34FB")
 
-    // Audio data char framing: first 3 bytes are header (seq counter + frame idx),
-    // payload starts at byte 3. See firmware/scripts/devkit/client.py:129.
-    const val FRAME_HEADER_BYTES = 3
+    // Stored-record framing: a ring record is a fixed 444-byte packet whose audio begins after a
+    // 5-byte prefix (a 4-byte big-endian timestamp + a 1-byte frame length).  MEASURED, not assumed —
+    // sweeping every candidate header length and clip-scoring the decoded waveform left 5 as the only
+    // non-clipping answer (0.0% clipped; every other length desynchronised the Opus packets and pinned
+    // the waveform).  The LIVE stream's header is a different, 3-byte thing.
+    const val FRAME_HEADER_BYTES = 5
 
     /**
      * Codec byte returned by AUDIO_CODEC_CHAR. Decode per firmware enum.

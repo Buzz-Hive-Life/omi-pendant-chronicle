@@ -89,6 +89,11 @@ class OmiBleClient(private val context: Context) {
         val lastReadAt: Long = 0L,
         val lastError: String? = null,
         val message: String? = null,
+        // ── the ring, in its own terms (packets, not bytes-of-files) ──
+        val ringReadSeq: Long = -1L,
+        val ringWriteSeq: Long = -1L,
+        val ringCapacity: Long = 0L,
+        val ringPacketBytes: Int = 0,
     )
 
     data class MicGainStatus(
@@ -119,12 +124,6 @@ class OmiBleClient(private val context: Context) {
         val rawCode: Int = 0,
         val receivedAt: Long = 0L,
         val subscribed: Boolean = false,
-    )
-
-    private data class StorageFile(
-        val index: Int,
-        val timestamp: Long,
-        val size: Long,
     )
 
     private val tag = "OmiBleClient"
@@ -230,8 +229,8 @@ class OmiBleClient(private val context: Context) {
     val buttonEvents: SharedFlow<ButtonStatus> = _buttonEvents.asSharedFlow()
 
     /**
-     * Live notifications are best-effort, but storage replay must not silently drop.
-     * Storage frames use suspending emit in [emitStorageFrame].
+     * Live notifications are best-effort.  Storage records are NOT emitted on this flow at all: they are
+     * handed to the safety checkpoint as a whole window and uploaded from the durable phone-local file.
      */
     private val _frames = MutableSharedFlow<ByteArray>(
         replay = 0,
@@ -284,31 +283,38 @@ class OmiBleClient(private val context: Context) {
     private val notifyQueue = ArrayDeque<BluetoothGattCharacteristic>()
     private val notifyEnabled = mutableSetOf<UUID>()
     private var notifyWriteInFlight = false
-    private var storageFiles: List<StorageFile> = emptyList()
-    private var currentStorageFile: StorageFile? = null
-    private var currentStorageBytes = ByteArrayOutputStream()
+    // ── ring drain state (lives across BLE reconnects; the CURSOR is the progress) ─────────────
+    private var ringReadSeq = -1L          // ring read cursor from the last INFO (-1 = unknown)
+    private var ringWriteSeq = -1L         // where recorded audio ends (packets)
+    private var ringCapacity = 0L
+    private var ringPacketBytes = RING_PACKET_BYTES_DEFAULT
+    private var ringId = 0L
+    private var ringCaps = 0
+    private var ringVersion = 0
+    private var ringLastSeq = -1L          // last sequence RECEIVED — the resume point (persisted)
+    private var ringSeqFloor = 0L          // sequence of the first record of the current window
+    private var ringPacketIndex = 0L       // records carved in the current window
+    private var ringDraining = false
+    private var ringCustodyGranted = false
+    private var ringWindow = ByteArrayOutputStream()
+    private val ringFrames = ArrayList<ByteArray>()
+    private var pendingAdvance: PendingAdvance? = null
     private var storageReadGeneration = 0
     private var lastStorageReadProgressAt = 0L
-    private var lastStorageReadProgressLogBytes = 0
-    private var pendingStorageDelete: PendingStorageDelete? = null
-    private var storageDeleteGeneration = 0
     private var storageCleanupDeleted = 0
     private var storageCleanupFailed = 0
     private var storageFileSafetyCheckpoint: (suspend (StorageFilePayload) -> Boolean)? = null
-    private val completedStorageFileKeys = mutableSetOf<String>()
-    private val skippedStorageFileKeys = mutableSetOf<String>()
     private var storageRetryGeneration = 0
     private var storageRetryAttempts = 0
 
     private enum class AfterMicGain { NONE, STORAGE_SYNC, LIVE_STREAM, DISCONNECT }
 
-    private data class PendingStorageDelete(
-        val file: StorageFile,
-        val doneCount: Int,
-        val generation: Int,
+    private data class PendingAdvance(
+        val seq: Long,
+        val onAck: (Int) -> Unit,
     )
 
-    private fun StorageFile.key(): String = "$timestamp:$size"
+    private fun u(value: Long): String = java.lang.Long.toUnsignedString(value)
 
     // ---- Scanning ----
 
@@ -556,12 +562,10 @@ class OmiBleClient(private val context: Context) {
         notifyWriteInFlight = false
         val button = _buttonStatus.value
         _buttonStatus.value = button.copy(subscribed = false)
-        storageFiles = emptyList()
-        currentStorageFile = null
-        currentStorageBytes.reset()
-        pendingStorageDelete = null
-        completedStorageFileKeys.clear()
-        skippedStorageFileKeys.clear()
+        persistPartialRingWindow()
+        ringFrames.clear()
+        ringWindowReset()
+        ringDraining = false
         failStorageSyncIfActive("BLE disconnected during storage sync")
         failStorageStatsIfActive("BLE disconnected during storage stats read")
         _state.value = State.DISCONNECTED
@@ -600,9 +604,10 @@ class OmiBleClient(private val context: Context) {
                     notifyWriteInFlight = false
                     val button = _buttonStatus.value
                     _buttonStatus.value = button.copy(subscribed = false)
-                    pendingStorageDelete = null
-                    completedStorageFileKeys.clear()
-                    skippedStorageFileKeys.clear()
+                    persistPartialRingWindow()
+                    ringFrames.clear()
+                    ringWindowReset()
+                    ringDraining = false
                     g.close()
                 }
             }
@@ -769,7 +774,9 @@ class OmiBleClient(private val context: Context) {
                 if (chUuid == OmiUuids.STORAGE_WRITE_CHAR) {
                     storageNotifyEnabled = true
                     Log.i(tag, "Storage notifications enabled")
-                    requestStorageFileList(g)
+                    // Subscribing to 30295781 is itself what sets storage_is_on in the firmware — and the
+                    // session then opens with CUSTODY_ENABLE, not a file-list request.
+                    startRingSession(g)
                 } else if (chUuid == OmiUuids.AUDIO_DATA_CHAR) {
                     _state.value = State.SUBSCRIBED
                     Log.i(tag, "Audio notifications enabled")
@@ -938,21 +945,55 @@ class OmiBleClient(private val context: Context) {
         }
     }
 
+    /**
+     * The status characteristic (30295782) read.  The firmware's own handler answers this READ with four
+     * LITTLE-ENDIAN u32 — `used_bytes, unread_packets, free_bytes, rtc_valid` (storage.c:
+     * storage_read_characteristic) — while some builds answer with the full 41-byte INFO block.  Both are
+     * accepted here; the ring is named in ITS OWN terms (read_seq / write_seq / packets), not a file list.
+     */
     private fun handleStorageStatsRead(g: BluetoothGatt, value: ByteArray, status: Int) {
         if (status != BluetoothGatt.GATT_SUCCESS) {
             failStorageStats("Storage stats read failed status=$status")
             return
         }
-        if (value.size < 8) {
-            failStorageStats("Storage stats payload too short (${value.size} bytes)")
-            return
+        val usedBytes: Long
+        val unreadPackets: Long
+        when {
+            value.size >= RingCommands.INFO_LEN -> {
+                ringReadSeq = readBe64(value, 1)
+                ringWriteSeq = readBe64(value, 9)
+                ringCapacity = readBe32(value, 17)
+                val pkt = readBe16(value, 29)
+                ringPacketBytes = if (pkt in 16..2048) pkt else RING_PACKET_BYTES_DEFAULT
+                ringCaps = value[31].toInt() and 0xFF
+                ringVersion = value[32].toInt() and 0xFF
+                ringId = readBe64(value, 33)
+                unreadPackets = (ringWriteSeq - ringReadSeq).coerceAtLeast(0L)
+                usedBytes = unreadPackets * ringPacketBytes.toLong()
+            }
+            value.size >= 16 -> {
+                usedBytes = readU32Le(value, 0)
+                unreadPackets = readU32Le(value, 4)
+            }
+            else -> {
+                failStorageStats("Storage status payload too short (${value.size} bytes)")
+                return
+            }
         }
+        val freeBytes = when {
+            value.size >= RingCommands.INFO_LEN ->
+                (ringCapacity - unreadPackets).coerceAtLeast(0L) * ringPacketBytes.toLong()
+            value.size >= 12 -> readU32Le(value, 8)
+            else -> null
+        }
+        val statusFlags = when {
+            value.size >= RingCommands.INFO_LEN -> ringCaps.toLong()
+            value.size >= 16 -> readU32Le(value, 12)
+            else -> 0L
+        }
+        val fileCount = unreadPackets.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
 
         val current = _storageStats.value
-        val usedBytes = readU32Le(value, 0)
-        val fileCount = readU32Le(value, 4).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-        val freeBytes = if (value.size >= 12) readU32Le(value, 8) else null
-        val statusFlags = if (value.size >= 16) readU32Le(value, 12) else 0L
         val previousUsed = current.usedBytes
         val previousFiles = current.fileCount
         val deltaBytes = if (previousUsed >= 0L) usedBytes - previousUsed else null
@@ -963,10 +1004,10 @@ class OmiBleClient(private val context: Context) {
         val proofStep = storageStatsProofStep
         val message = when {
             proofStep == 1 -> "Baseline captured; waiting at least ${proofWindowMs / 1000L}s with BLE disconnected"
-            proofStep == 2 && (deltaBytes ?: 0L) > 0L -> "Recording proof passed: flash grew by $deltaBytes bytes"
-            proofStep == 2 -> "No flash growth detected during the proof window"
-            deltaBytes != null && deltaBytes > 0L -> "Flash grew by $deltaBytes bytes since last check"
-            else -> "Flash counters read"
+            proofStep == 2 && (deltaBytes ?: 0L) > 0L -> "Recording proof passed: ring grew by $deltaBytes bytes"
+            proofStep == 2 -> "No ring growth detected during the proof window"
+            deltaBytes != null && deltaBytes > 0L -> "Ring grew by $deltaBytes bytes since last check"
+            else -> "Ring counters read"
         }
 
         _storageStats.value = current.copy(
@@ -983,8 +1024,12 @@ class OmiBleClient(private val context: Context) {
             lastReadAt = now,
             lastError = null,
             message = message,
+            ringReadSeq = ringReadSeq,
+            ringWriteSeq = ringWriteSeq,
+            ringCapacity = ringCapacity,
+            ringPacketBytes = ringPacketBytes,
         )
-        Log.i(tag, "Storage stats used=$usedBytes files=$fileCount deltaBytes=${deltaBytes ?: "n/a"}")
+        Log.i(tag, "Ring stats used=$usedBytes packets=$fileCount unread=$unreadPackets deltaBytes=${deltaBytes ?: "n/a"}")
 
         if (proofStep == 1) {
             val generation = storageStatsProofGeneration
@@ -999,7 +1044,7 @@ class OmiBleClient(private val context: Context) {
                 if (storageStatsProofGeneration == generation && storageStatsProofStep == 2) {
                     beginStorageStatsRead(
                         disconnectAfterRead = true,
-                        message = "Reading flash after sample",
+                        message = "Reading ring after sample",
                         generation = generation,
                     )
                 }
@@ -1022,14 +1067,17 @@ class OmiBleClient(private val context: Context) {
         }
     }
 
+
     private fun beginStorageSync(g: BluetoothGatt) {
         pendingStorageSync = true
         _state.value = State.SYNCING
         resetStorageCleanupState()
         _storageSync.value = StorageSyncStatus(active = true)
-        pendingStorageDelete = null
-        completedStorageFileKeys.clear()
-        skippedStorageFileKeys.clear()
+        ringFrames.clear()
+        ringWindowReset()
+        ringDraining = false
+        // The last sequence received survives a reconnect — load it if this process is fresh.
+        if (ringLastSeq < 0L) ringLastSeq = prefs.getLong(PREF_RING_LAST_SEQ, -1L)
         g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
         queueButtonNotify(g)
         queueTelemetryNotify(g)
@@ -1141,139 +1189,321 @@ class OmiBleClient(private val context: Context) {
         Log.i(tag, "Button event ${event.label} raw=$raw bytes=${value.joinToString(" ") { "%02x".format(it) }}")
     }
 
-    private fun requestStorageFileList(g: BluetoothGatt) {
-        val ch = storageWriteChar(g) ?: return completeStorageSync("Storage write characteristic not found")
-        _storageSync.value = _storageSync.value.copy(active = true)
-        writeStorageCommand(g, ch, byteArrayOf(CMD_LIST_FILES))
-    }
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
+    //  THE RING — a SEQUENCE drain, not a file list.
+    //
+    //  The pendant's firmware keeps stored audio in a RING BUFFER: a monotonic packet sequence and a
+    //  reader cursor.  There are NO FILES.  Every command is `[opcode][args…]` with BIG-ENDIAN fields
+    //  and NO epoch prefix; requests go to the control characteristic 30295781 and the answers come
+    //  back on it as ACK / INFO / DATA / DONE / READ_BEGIN / LIVE_MARK.
+    //
+    //  So the unit of work is a SEQUENCE, not a file: the resume point across a reconnect is the last
+    //  sequence received, and a completed window is committed with CMD_RING_ADVANCE.  The pendant
+    //  drops the link every ~10-15 s, so a cursor — not a restart-from-zero — is what lets a backlog
+    //  larger than one window ever finish.
+    // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-    private fun requestStorageFile(g: BluetoothGatt, file: StorageFile) {
+    /** Open a ring session: grant custody, then ask the ring for its INFO. */
+    private fun startRingSession(g: BluetoothGatt) {
         val ch = storageWriteChar(g) ?: return completeStorageSync("Storage write characteristic not found")
-        currentStorageFile = file
-        currentStorageBytes = ByteArrayOutputStream(file.size.coerceAtMost(512_000).toInt())
-        val generation = ++storageReadGeneration
+        ringWindowReset()
+        ringFrames.clear()
+        ringDraining = false
+        ringCustodyGranted = false
         lastStorageReadProgressAt = System.currentTimeMillis()
-        lastStorageReadProgressLogBytes = 0
-        Log.i(tag, "Reading pendant file index=${file.index} ts=${file.timestamp} size=${file.size}")
-        scheduleStorageReadWatchdog(generation)
-        val cmd = byteArrayOf(
-            CMD_READ_FILE,
-            file.index.toByte(),
-            0,
-            0,
-            0,
-            0,
-        )
-        writeStorageCommand(g, ch, cmd)
+        // ⚡ CUSTODY FIRST — it is the gate.  storage_connection_changed() CLEARS custody on every
+        // connect, so it must be re-sent per session.  Payload is EXACTLY 3 bytes: {opcode, version, caps}.
+        Log.i(tag, "Ring: → CUSTODY_ENABLE (0x14) v${RingCommands.CUSTODY_VERSION} caps=0x%02x".format(RingCommands.CUSTODY_CAPS))
+        writeStorageCommand(g, ch, RingCommands.custodyEnable(), failSyncOnError = true) { wrote ->
+            if (!wrote) return@writeStorageCommand
+            handler.postDelayed({
+                if (gatt == g && pendingStorageSync) requestRingInfo(g)
+            }, RING_CUSTODY_SETTLE_MS)
+        }
     }
 
-    private fun writeStorageCommand(
-        g: BluetoothGatt,
-        ch: BluetoothGattCharacteristic,
-        cmd: ByteArray,
-        failSyncOnError: Boolean = true,
-        retryCount: Int = 0,
-        onComplete: (Boolean) -> Unit = {}
-    ) {
-        handler.post {
-            if (gatt == null || gatt != g) {
-                Log.w(tag, "Aborting writeStorageCommand: GATT connection changed or null")
-                onComplete(false)
-                return@post
-            }
-            val success = writeCharacteristicCompat(
-                g,
-                ch,
-                cmd,
-                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+    private fun requestRingInfo(g: BluetoothGatt) {
+        val ch = storageWriteChar(g) ?: return
+        Log.i(tag, "Ring: → RING_INFO (0x10)")
+        writeStorageCommand(g, ch, RingCommands.ringInfo(), failSyncOnError = true)
+    }
+
+    /** INFO reply — the 41-byte layout (storage.c:400-409).  This is the ONLY source of the cursor. */
+    private fun handleRingInfo(value: ByteArray) {
+        if (value.size < RingCommands.INFO_LEN) {
+            Log.w(
+                tag,
+                "Ring INFO short: ${value.size} of ${RingCommands.INFO_LEN} bytes — " +
+                    "the ATT MTU must be ≥ ${RingCommands.INFO_MIN_ATT_MTU} for the INFO notify to carry it"
             )
-            if (!success) {
-                if (retryCount < 10) {
-                    Log.w(tag, "Failed to write storage command 0x${cmd.first().toInt().and(0xFF).toString(16)}, retrying (${retryCount + 1}/10)...")
-                    handler.postDelayed({
-                        writeStorageCommand(g, ch, cmd, failSyncOnError, retryCount + 1, onComplete)
-                    }, 100)
-                } else {
-                    val message = "Failed to write storage command 0x${cmd.first().toInt().and(0xFF).toString(16)} after 10 attempts"
-                    if (failSyncOnError) {
-                        completeStorageSync(message)
-                    } else {
-                        Log.w(tag, message)
-                    }
-                    onComplete(false)
-                }
-            } else {
-                onComplete(true)
-            }
-        }
-    }
-
-    private fun storageWriteChar(g: BluetoothGatt): BluetoothGattCharacteristic? =
-        g.getService(OmiUuids.STORAGE_SERVICE)?.getCharacteristic(OmiUuids.STORAGE_WRITE_CHAR)
-
-    private fun handleStorageNotify(value: ByteArray) {
-        if (value.isEmpty()) return
-        val g = gatt ?: return completeStorageSync("GATT missing during storage sync")
-
-        if (pendingStorageDelete != null) {
-            handleStorageDeleteResult(value, g)
             return
         }
-
-        if (currentStorageFile == null) {
-            handleStorageList(value, g)
-            return
-        }
-
-        if (value.size == 1) {
-            val status = value[0].toInt() and 0xFF
-            when (status) {
-                STORAGE_OK -> return
-                STORAGE_DONE -> {
-                    finishCurrentStorageFile(g)
-                    return
-                }
-                FILE_NOT_FOUND -> {
-                    handleStorageReadMissing(g, currentStorageFile ?: return, status)
-                    return
-                }
-                FILE_INDEX_OUT_OF_RANGE -> {
-                    handleStorageReadStaleIndex(g, currentStorageFile ?: return, status)
-                    return
-                }
-                else -> {
-                    completeStorageSync("Storage read status ${storageStatusLabel(status)} index=${currentStorageFile?.index}")
-                    return
-                }
-            }
-        }
-
-        if (value.size <= STORAGE_TIMESTAMP_BYTES) return
-        currentStorageBytes.write(value, STORAGE_TIMESTAMP_BYTES, value.size - STORAGE_TIMESTAMP_BYTES)
-        noteStorageReadProgress(currentStorageFile ?: return)
+        ringReadSeq = readBe64(value, 1)
+        ringWriteSeq = readBe64(value, 9)
+        ringCapacity = readBe32(value, 17)
+        val pkt = readBe16(value, 29)
+        ringPacketBytes = if (pkt in 16..2048) pkt else RING_PACKET_BYTES_DEFAULT
+        ringCaps = value[31].toInt() and 0xFF
+        ringVersion = value[32].toInt() and 0xFF
+        ringId = readBe64(value, 33)
+        val unread = (ringWriteSeq - ringReadSeq).coerceAtLeast(0L)
+        Log.i(
+            tag,
+            "Ring INFO read=${u(ringReadSeq)} write=${u(ringWriteSeq)} unread=$unread cap=${u(ringCapacity)} " +
+                "pkt=$ringPacketBytes caps=0x%02x ver=$ringVersion ring=${u(ringId)}".format(ringCaps)
+        )
+        publishRingStats(unread)
         val s = _storageSync.value
-        _storageSync.value = s.copy(bytesDone = s.bytesDone + value.size - STORAGE_TIMESTAMP_BYTES)
+        _storageSync.value = s.copy(
+            active = true,
+            filesTotal = maxOf(s.filesTotal, s.filesDone + unread.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()),
+            bytesTotal = maxOf(s.bytesTotal, s.bytesDone + unread * ringPacketBytes.toLong()),
+        )
+        if (unread > 0L) beginRingRead(gatt ?: return)
+        else completeStorageSync()
     }
 
-    private fun noteStorageReadProgress(file: StorageFile) {
-        val now = System.currentTimeMillis()
-        lastStorageReadProgressAt = now
-        val bytes = currentStorageBytes.size()
-        if (bytes - lastStorageReadProgressLogBytes >= STORAGE_READ_PROGRESS_LOG_BYTES || bytes.toLong() >= file.size) {
-            lastStorageReadProgressLogBytes = bytes
-            Log.i(tag, "Storage read progress index=${file.index} bytes=$bytes/${file.size}")
+    /** Send RING_READ: `[0x11][BE64 start_seq]` = 9 bytes.  The firmware reads `sys_get_be64(data+1)`. */
+    private fun beginRingRead(g: BluetoothGatt) {
+        val ch = storageWriteChar(g) ?: return completeStorageSync("Storage write characteristic not found")
+        val start = ringResumeSeq()
+        if (start < 0L) return completeStorageSync("Ring has no readable sequence")
+        ringSeqFloor = start
+        ringPacketIndex = 0
+        ringDraining = true
+        lastStorageReadProgressAt = System.currentTimeMillis()
+        storageReadGeneration++
+        scheduleStorageReadWatchdog(storageReadGeneration)
+        Log.i(tag, "Ring: → RING_READ (0x11) from seq ${u(start)}")
+        // ⚠️ From the CURSOR — NEVER a literal 0, and never a 6-byte [index,0,0,0,0] form: the 9-byte
+        // length is enforced and a wrong length is the INVALID_COMMAND the old code kept getting.
+        writeStorageCommand(g, ch, RingCommands.ringRead(start), failSyncOnError = true)
+    }
+
+    /**
+     * The resume point, in the ring's own terms.  The firmware advances its read cursor as it SENDs, so
+     * `read_seq` normally *is* the resume point across reconnects; [ringLastSeq] — the last sequence this
+     * client actually received, persisted in prefs — only narrows it forward when a drop lands mid-window.
+     * NEVER a literal 0 default.
+     */
+    private fun ringResumeSeq(): Long {
+        val readSeq = ringReadSeq
+        if (readSeq < 0L) return -1L
+        val last = ringLastSeq
+        return if (last in readSeq..ringWriteSeq) last else readSeq
+    }
+
+    /** DATA reply: `[0x03][raw ring bytes…]`.  Fragment boundaries are NOT record boundaries. */
+    private fun handleRingData(value: ByteArray) {
+        if (value.size <= 1) return
+        if (!ringDraining) {
+            Log.w(tag, "Ring DATA with no active window (${value.size} bytes) — ignoring rather than mis-framing")
+            return
+        }
+        ringWindow.write(value, 1, value.size - 1)
+        val received = (value.size - 1).toLong()
+
+        // Carve complete records out of the fragment stream.  A stored record is a fixed 444-byte packet
+        // (INFO.packet_bytes); the fragment is arbitrary, so we reassemble and slice.
+        val all = ringWindow.toByteArray()
+        var consumed = 0
+        var carved = 0
+        while (all.size - consumed >= ringPacketBytes) {
+            ringFrames.add(all.copyOfRange(consumed, consumed + ringPacketBytes))
+            consumed += ringPacketBytes
+            carved++
+        }
+        if (carved > 0) {
+            ringWindow.reset()
+            if (consumed < all.size) ringWindow.write(all, consumed, all.size - consumed)
+            ringPacketIndex += carved
+            // ⇒ THE SEQUENCE ADVANCED.  This — not a byte count — is what restarts the idle timer and
+            //   what makes the value the resume point across a reconnect.
+            ringLastSeq = ringSeqFloor + ringPacketIndex - 1L
+            saveRingLastSeq()
+            lastStorageReadProgressAt = System.currentTimeMillis()
+        }
+        val s = _storageSync.value
+        _storageSync.value = s.copy(
+            bytesDone = s.bytesDone + received,
+            filesDone = s.filesDone + carved,
+            framesDone = s.framesDone + carved,
+        )
+    }
+
+    /** DONE reply: `[0x04][status][BE64 next_seq]` — the transfer reached the write edge. */
+    private fun handleRingDone(value: ByteArray) {
+        val status = if (value.size >= 2) value[1].toInt() and 0xFF else RingCommands.ACK_OK
+        val nextSeq = if (value.size >= 10) readBe64(value, 2) else ringLastSeq + 1L
+        ringDraining = false
+        Log.i(tag, "Ring: ← DONE status=${storageStatusLabel(status)} next_seq=${u(nextSeq)}")
+        if (status != RingCommands.ACK_OK) {
+            completeStorageSync("Ring read ended status=${storageStatusLabel(status)}")
+            return
+        }
+        // A DONE that carried nothing AND moved nothing would loop forever (READ → DONE → ADVANCE →
+        // INFO → READ …).  Treat it as a stalled window so the retry path — not a spin — handles it.
+        if (ringFrames.isEmpty() && nextSeq <= ringSeqFloor) {
+            completeStorageSync("Ring returned no progress at seq ${u(nextSeq)}")
+            return
+        }
+        if (nextSeq > 0L && ringLastSeq < nextSeq - 1L) ringLastSeq = nextSeq - 1L
+        // Persist what we hold FIRST (the phone is the durable side), then ADVANCE to commit it.
+        flushRingWindow { ok ->
+            if (!ok) return@flushRingWindow
+            val g = gatt
+            if (g == null) {
+                completeStorageSync()
+                return@flushRingWindow
+            }
+            // ADVANCE to the cursor the DONE named — everything through it is consumed, and the next
+            // INFO decides whether the ring holds a further window.
+            ringAdvance(g, nextSeq) { requestRingInfo(g) }
         }
     }
 
+    /** ACK reply: `[0x01][status]` (2 bytes), or a custody reply `[0x01][0][granted]` (3 bytes). */
+    private fun handleRingAck(value: ByteArray) {
+        if (value.size >= 3 && value[1].toInt() == 0) {
+            ringCustodyGranted = (value[2].toInt() and RingCommands.OMI_CAP_LIVE_PERSIST) != 0
+            Log.i(tag, "Ring custody granted caps=0x%02x livePersist=$ringCustodyGranted".format(value[2].toInt() and 0xFF))
+            return
+        }
+        val status = if (value.size >= 2) value[1].toInt() and 0xFF else RingCommands.ACK_OK
+        val pending = pendingAdvance
+        if (pending != null) {
+            pendingAdvance = null
+            if (status == RingCommands.ACK_OK) {
+                storageCleanupDeleted++
+                updateStorageCleanupStatus(0, true, storageStatusLabel(status), active = false)
+            } else {
+                storageCleanupFailed++
+                updateStorageCleanupStatus(0, false, storageStatusLabel(status), active = false)
+            }
+            pending.onAck(status)
+            return
+        }
+        if (status != RingCommands.ACK_OK) {
+            Log.w(tag, "Ring ACK status=${storageStatusLabel(status)}")
+            if (status == RingCommands.INVALID_COMMAND || status == RingCommands.SEQ_OUT_OF_RANGE ||
+                status == RingCommands.RING_ID_MISMATCH
+            ) {
+                completeStorageSync("Ring refused a command: ${storageStatusLabel(status)}")
+            }
+        }
+    }
+
+    private fun ringAdvance(g: BluetoothGatt, seq: Long, onDone: () -> Unit) {
+        val ch = storageWriteChar(g)
+        if (ch == null || seq < 0L) {
+            onDone()
+            return
+        }
+        pendingAdvance = PendingAdvance(seq = seq, onAck = { onDone() })
+        Log.i(tag, "Ring: → RING_ADVANCE (0x12) to seq ${u(seq)}")
+        writeStorageCommand(g, ch, RingCommands.ringAdvance(seq), failSyncOnError = false) { wrote ->
+            if (!wrote) {
+                pendingAdvance = null
+                storageCleanupFailed++
+                updateStorageCleanupStatus(0, false, "LOCAL_WRITE_FAILED", active = false)
+                onDone()
+            }
+        }
+    }
+
+    /**
+     * Persist the records we hold to the phone BEFORE anything is reclaimed, then run them through the
+     * safety checkpoint.  A drop must not discard audio that already reached us.
+     */
+    private fun flushRingWindow(onDone: (Boolean) -> Unit) {
+        val frames = ArrayList(ringFrames)
+        ringFrames.clear()
+        ringWindowReset()
+        if (frames.isEmpty()) {
+            onDone(true)
+            return
+        }
+        val size = frames.sumOf { it.size.toLong() }
+        val ts = ringRecordTimestamp(frames.first())
+        if (ts <= 0L) {
+            val s = _storageSync.value
+            _storageSync.value = s.copy(missingTimestampFiles = s.missingTimestampFiles + 1)
+        }
+        updateStorageCleanupStatus(0, null, "persisting ${frames.size} records", active = true)
+        scope.launch {
+            val ok = runStorageSafetyCheckpoint(frames, ts, size)
+            handler.post {
+                if (ok) Log.i(tag, "Ring window persisted frames=${frames.size} bytes=$size")
+                else Log.w(tag, "Ring window NOT safe on phone frames=${frames.size} — pendant data left unreclaimed")
+                onDone(ok)
+            }
+        }
+    }
+
+    /** The link dropped mid-drain: keep what already arrived; the ring's own cursor resumes us. */
+    private fun persistPartialRingWindow() {
+        if (!ringDraining && ringFrames.isEmpty()) return
+        ringDraining = false
+        flushRingWindow { }
+    }
+
+    /** A record's first 4 bytes ARE a big-endian timestamp (custody.h: omi_record_timestamp). */
+    private fun ringRecordTimestamp(record: ByteArray): Long {
+        if (record.size < 4) return 0L
+        val raw = ((record[0].toLong() and 0xFF) shl 24) or ((record[1].toLong() and 0xFF) shl 16) or
+            ((record[2].toLong() and 0xFF) shl 8) or (record[3].toLong() and 0xFF)
+        // UTC seconds, or uptime seconds with bit 31 SET.  The store wants a plausible epoch; an uptime
+        // flag or anything out of range becomes 0 (the store then uses sync time and flags it unverified).
+        return if (raw in MIN_REASONABLE_EPOCH_SECONDS..MAX_REASONABLE_EPOCH_SECONDS) raw else 0L
+    }
+
+    private fun ringWindowReset() {
+        ringWindow.reset()
+        ringPacketIndex = 0
+    }
+
+    private fun saveRingLastSeq() {
+        if (ringLastSeq >= 0L) prefs.edit().putLong(PREF_RING_LAST_SEQ, ringLastSeq).apply()
+    }
+
+    /** Map the ring (packets, not files) onto the status surface the UI already renders. */
+    private fun publishRingStats(unreadPackets: Long) {
+        val bytes = unreadPackets.coerceAtLeast(0L) * ringPacketBytes.toLong()
+        val free = (ringCapacity - unreadPackets).coerceAtLeast(0L) * ringPacketBytes.toLong()
+        val now = System.currentTimeMillis()
+        val current = _storageStats.value
+        val deltaBytes = if (current.usedBytes >= 0L) bytes - current.usedBytes else null
+        _storageStats.value = current.copy(
+            active = false,
+            usedBytes = bytes,
+            fileCount = unreadPackets.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+            freeBytes = free,
+            statusFlags = ringCaps.toLong(),
+            previousUsedBytes = current.usedBytes,
+            previousFileCount = current.fileCount,
+            deltaBytes = deltaBytes,
+            deltaFiles = null,
+            lastReadAt = now,
+            lastError = null,
+            message = "ring read=${u(ringReadSeq)} write=${u(ringWriteSeq)} unread=$unreadPackets pkts @ ${ringPacketBytes}B",
+            ringReadSeq = ringReadSeq,
+            ringWriteSeq = ringWriteSeq,
+            ringCapacity = ringCapacity,
+            ringPacketBytes = ringPacketBytes,
+        )
+    }
+
+    /** The idle watchdog.  It restarts on a SEQUENCE advance (a carved record), not on a byte count. */
     private fun scheduleStorageReadWatchdog(generation: Int) {
         handler.postDelayed({
             if (generation != storageReadGeneration) return@postDelayed
-            val file = currentStorageFile ?: return@postDelayed
+            if (!ringDraining) return@postDelayed
             if (!pendingStorageSync || _state.value != State.SYNCING) return@postDelayed
             val idleMs = System.currentTimeMillis() - lastStorageReadProgressAt
             if (idleMs >= STORAGE_READ_STALL_TIMEOUT_MS) {
                 completeStorageSync(
-                    "Storage read stalled ${idleMs / 1000}s index=${file.index} bytes=${currentStorageBytes.size()}/${file.size}"
+                    "Ring read stalled ${idleMs / 1000}s at seq ${u(ringLastSeq)} " +
+                        "(${_storageSync.value.filesDone} packets this session)"
                 )
                 return@postDelayed
             }
@@ -1281,334 +1511,43 @@ class OmiBleClient(private val context: Context) {
         }, STORAGE_READ_STALL_CHECK_MS)
     }
 
-    private fun estimateStorageTimestamps(parsed: List<StorageFile>): List<StorageFile> {
-        val result = parsed.toMutableList()
-        val n = result.size
-        if (n == 0) return result
-
-        var i = n - 1
-        while (i >= 0) {
-            if (!isReasonableTimestamp(result[i].timestamp)) {
-                var anchorMs = System.currentTimeMillis()
-                var anchorIndex = i + 1
-                while (anchorIndex < n) {
-                    if (isReasonableTimestamp(result[anchorIndex].timestamp)) {
-                        anchorMs = result[anchorIndex].timestamp * 1000L
-                        break
-                    }
-                    anchorIndex++
-                }
-
-                var currentEnd = anchorMs
-                var j = anchorIndex - 1
-                while (j >= i) {
-                    val file = result[j]
-                    if (!isReasonableTimestamp(file.timestamp)) {
-                        val dur = (file.size * 20) / 90
-                        val estimatedStart = currentEnd - dur
-                        result[j] = file.copy(timestamp = estimatedStart / 1000L)
-                        currentEnd = estimatedStart - 1000L
-                    } else {
-                        break
-                    }
-                    j--
-                }
-                i = j
-            } else {
-                i--
-            }
-        }
-        return result
-    }
-
-    private fun isReasonableTimestamp(timestamp: Long): Boolean {
-        return timestamp in 1500000000L..4102444800L
-    }
-
-    private fun handleStorageList(value: ByteArray, g: BluetoothGatt) {
-        if (value.size == 1) {
-            val statusOrCount = value[0].toInt() and 0xFF
-            if (statusOrCount == 0) {
-                completeStorageSync()
-            } else {
-                completeStorageSync("Storage list status ${storageStatusLabel(statusOrCount)}")
-            }
-            return
-        }
-
-        val count = value[0].toInt() and 0xFF
-        if (count == 0) {
-            completeStorageSync()
-            return
-        }
-        val parsed = mutableListOf<StorageFile>()
-        var offset = 1
-        for (i in 0 until count) {
-            if (offset + 8 > value.size) break
-            val ts = readU32Be(value, offset)
-            val size = readU32Be(value, offset + 4)
-            parsed += StorageFile(index = i, timestamp = ts, size = size)
-            offset += 8
-        }
-        val estimated = estimateStorageTimestamps(parsed)
-        storageFiles = estimated
-        Log.i(tag, "Storage files listed: ${estimated.size}")
-        val current = _storageSync.value
-        val remainingKnown = parsed.count { it.key() !in completedStorageFileKeys && it.key() !in skippedStorageFileKeys }
-        val remainingBytes = parsed
-            .filter { it.key() !in completedStorageFileKeys && it.key() !in skippedStorageFileKeys }
-            .sumOf { it.size }
-        _storageSync.value = current.copy(
-            active = true,
-            filesTotal = maxOf(current.filesTotal, current.filesDone + remainingKnown),
-            bytesTotal = maxOf(current.bytesTotal, current.bytesDone + remainingBytes),
-        )
-        requestNextStorageFile(g)
-    }
-
-    private fun requestNextStorageFile(g: BluetoothGatt) {
-        val next = storageFiles.firstOrNull {
-            it.key() !in completedStorageFileKeys && it.key() !in skippedStorageFileKeys
-        }
-        if (next == null) {
-            Log.i(tag, "Storage file batch drained; requesting next batch")
-            requestStorageFileList(g)
-        } else {
-            requestStorageFile(g, next)
-        }
-    }
-
-    private fun handleStorageReadMissing(g: BluetoothGatt, file: StorageFile, status: Int) {
-        skippedStorageFileKeys += file.key()
-        val current = _storageSync.value
-        val nextDone = (current.filesDone + 1).coerceAtMost(
-            current.filesTotal.coerceAtLeast(current.filesDone + 1)
-        )
-        _storageSync.value = current.copy(filesDone = nextDone)
-        Log.w(
-            tag,
-            "Storage read status ${storageStatusLabel(status)} index=${file.index} ts=${file.timestamp} size=${file.size}; refreshing list"
-        )
-        currentStorageFile = null
-        currentStorageBytes.reset()
-        requestStorageFileList(g)
-    }
-
-    private fun handleStorageReadStaleIndex(g: BluetoothGatt, file: StorageFile, status: Int) {
-        Log.w(
-            tag,
-            "Storage read status ${storageStatusLabel(status)} index=${file.index} ts=${file.timestamp} size=${file.size}; refreshing list"
-        )
-        currentStorageFile = null
-        currentStorageBytes.reset()
-        requestStorageFileList(g)
-    }
-
-    private fun finishCurrentStorageFile(g: BluetoothGatt) {
-        val file = currentStorageFile ?: return
-        val rawBytes = currentStorageBytes.toByteArray()
-        val currentFrameCount = frameCount
-        scope.launch {
-            val frames = buildStorageFrames(rawBytes, currentFrameCount)
-            if (frames.isEmpty()) {
-                handler.post {
-                    if (file.size == 0L) {
-                        val s = _storageSync.value
-                        val doneCount = s.filesDone + 1
-                        skippedStorageFileKeys += file.key()
-                        _storageSync.value = s.copy(filesDone = doneCount)
-                        Log.i(tag, "Storage file empty index=${file.index}; skipping zero-byte pendant file during sync")
-                        currentStorageFile = null
-                        currentStorageBytes.reset()
-                        continueAfterStorageFile(g, doneCount)
-                    } else {
-                        completeStorageSync("Storage file had no parsed frames index=${file.index}")
-                    }
-                }
-                return@launch
-            }
-            if (!runStorageSafetyCheckpoint(file, frames)) {
-                handler.post {
-                    completeStorageSync("Storage file not safe on phone index=${file.index}")
-                }
-                return@launch
-            }
-            
-            handler.post {
-                completedStorageFileKeys += file.key()
-                Log.i(tag, "Storage file safe index=${file.index} frames=${frames.size}")
-            }
-            
-            emitStorageFrames(frames)
-            
-            handler.post {
-                val s = _storageSync.value
-                val doneCount = s.filesDone + 1
-                val missingTimestampFiles = if (file.timestamp == 0L) {
-                    Log.w(tag, "Storage file index=${file.index} has missing timestamp ts=0; display sync/upload time as unverified")
-                    s.missingTimestampFiles + 1
-                } else {
-                    s.missingTimestampFiles
-                }
-                _storageSync.value = s.copy(
-                    filesDone = doneCount,
-                    framesDone = s.framesDone + frames.size.toLong(),
-                    missingTimestampFiles = missingTimestampFiles,
-                )
-                Log.i(tag, "Storage file synced index=${file.index} ts=${file.timestamp} size=${file.size} frames=${frames.size}")
-
-                currentStorageFile = null
-                currentStorageBytes.reset()
-                requestDeleteStorageFile(g, file, doneCount)
-            }
-        }
-    }
-
-    private fun buildStorageFrames(bytes: ByteArray, firstSeq: Long): List<ByteArray> {
-        val frames = ArrayList<ByteArray>()
-        var nextSeq = firstSeq
-        var blockStart = 0
-        while (blockStart < bytes.size) {
-            val blockEnd = minOf(blockStart + STORAGE_BLOCK_BYTES, bytes.size)
-            val usableEnd = minOf(blockStart + STORAGE_BLOCK_USABLE_BYTES, blockEnd)
-            var offset = blockStart
-
-            while (offset < usableEnd) {
-                val payloadLen = bytes[offset].toInt() and 0xFF
-                if (payloadLen == 0) break
-
-                val packetEnd = offset + 1 + payloadLen
-                if (payloadLen > MAX_STORAGE_OPUS_PAYLOAD || packetEnd > usableEnd) break
-
-                val frame = ByteArray(OmiUuids.FRAME_HEADER_BYTES + payloadLen)
-                val seq = nextSeq and 0xFFFF
-                frame[0] = (seq and 0xFF).toByte()
-                frame[1] = ((seq shr 8) and 0xFF).toByte()
-                frame[2] = 0
-                bytes.copyInto(frame, OmiUuids.FRAME_HEADER_BYTES, offset + 1, packetEnd)
-
-                frames += frame
-                nextSeq++
-                offset = packetEnd
-            }
-
-            blockStart += STORAGE_BLOCK_BYTES
-        }
-        return frames
-    }
-
-    private suspend fun runStorageSafetyCheckpoint(file: StorageFile, frames: List<ByteArray>): Boolean {
+    private suspend fun runStorageSafetyCheckpoint(frames: List<ByteArray>, timestamp: Long, size: Long): Boolean {
         val checkpoint = storageFileSafetyCheckpoint
         if (checkpoint == null) {
-            Log.w(tag, "Storage file safety checkpoint missing index=${file.index}; refusing pendant delete")
+            Log.w(tag, "Storage safety checkpoint missing; refusing pendant reclamation")
             return false
         }
         return try {
             checkpoint(
                 StorageFilePayload(
-                    index = file.index,
-                    timestamp = file.timestamp,
-                    size = file.size,
+                    index = 0,
+                    timestamp = timestamp,
+                    size = size,
                     frames = frames,
                 )
             )
         } catch (t: Throwable) {
-            Log.w(tag, "Storage file safety checkpoint failed index=${file.index}: ${t.message}")
+            Log.w(tag, "Storage safety checkpoint failed: ${t.message}")
             false
         }
     }
 
-    private suspend fun emitStorageFrames(frames: List<ByteArray>) {
-        for (frame in frames) {
-            frameCount++
-            lastFrameSize = frame.size
-            emitStorageFrame(frame)
+    /** Every reply from the ring is dispatched here by its 1-byte opcode. */
+    private fun handleStorageNotify(value: ByteArray) {
+        if (value.isEmpty()) return
+        when (value[0].toInt() and 0xFF) {
+            RingCommands.NOTIFY_ACK -> handleRingAck(value)
+            RingCommands.NOTIFY_INFO -> handleRingInfo(value)
+            RingCommands.NOTIFY_DATA -> handleRingData(value)
+            RingCommands.NOTIFY_DONE -> handleRingDone(value)
+            RingCommands.NOTIFY_READ_BEGIN -> Log.i(
+                tag,
+                "Ring: ← READ_BEGIN start=${if (value.size >= 9) u(readBe64(value, 1)) else "?"} " +
+                    "count=${if (value.size >= 13) readBe32(value, 9) else 0L}"
+            )
+            RingCommands.NOTIFY_LIVE_MARK -> Log.i(tag, "Ring: ← LIVE_MARK — the pendant is flagging live audio on the ring")
+            else -> Log.d(tag, "Ring: unhandled reply opcode 0x%02x (${value.size} bytes)".format(value[0].toInt() and 0xFF))
         }
-    }
-
-    private fun requestDeleteStorageFile(g: BluetoothGatt, file: StorageFile, doneCount: Int) {
-        val ch = storageWriteChar(g) ?: run {
-            storageCleanupFailed++
-            updateStorageCleanupStatus(file.index, false, "NO_STORAGE_WRITE_CHAR", active = false)
-            Log.w(tag, "Pendant file deleted index=${file.index} ok=false status=NO_STORAGE_WRITE_CHAR")
-            continueAfterStorageFile(g, doneCount)
-            return
-        }
-        val generation = ++storageDeleteGeneration
-        pendingStorageDelete = PendingStorageDelete(file = file, doneCount = doneCount, generation = generation)
-        updateStorageCleanupStatus(file.index, null, "delete requested", active = true)
-        Log.i(tag, "Deleting pendant file index=${file.index}")
-        writeStorageCommand(
-            g,
-            ch,
-            byteArrayOf(CMD_DELETE_FILE, file.index.toByte()),
-            failSyncOnError = false,
-        ) { wrote ->
-            if (!wrote) {
-                pendingStorageDelete = null
-                storageCleanupFailed++
-                updateStorageCleanupStatus(file.index, false, "LOCAL_WRITE_FAILED", active = false)
-                Log.w(tag, "Pendant file deleted index=${file.index} ok=false status=LOCAL_WRITE_FAILED")
-                continueAfterStorageFile(g, doneCount)
-            } else {
-                handler.postDelayed({
-                    val pending = pendingStorageDelete
-                    val activeGatt = gatt
-                    if (pending != null && pending.generation == generation && activeGatt != null) {
-                        pendingStorageDelete = null
-                        storageCleanupFailed++
-                        updateStorageCleanupStatus(pending.file.index, false, "TIMEOUT", active = false)
-                        Log.w(tag, "Pendant file deleted index=${pending.file.index} ok=false status=TIMEOUT")
-                        requestStorageFileList(activeGatt)
-                    }
-                }, STORAGE_DELETE_TIMEOUT_MS)
-            }
-        }
-    }
-
-    private fun handleStorageDeleteResult(value: ByteArray, g: BluetoothGatt) {
-        val pending = pendingStorageDelete ?: return
-        if (value.size != 1) return
-        pendingStorageDelete = null
-        val status = value[0].toInt() and 0xFF
-        when (status) {
-            STORAGE_OK -> {
-                storageCleanupDeleted++
-                updateStorageCleanupStatus(pending.file.index, true, storageStatusLabel(status), active = false)
-                applyDeleteIndexShift(pending.file.index, pending.doneCount)
-                Log.i(tag, "Pendant file deleted index=${pending.file.index} ok=true status=${storageStatusLabel(status)}")
-                continueAfterStorageFile(g, pending.doneCount)
-            }
-            FILE_NOT_FOUND -> {
-                storageCleanupDeleted++
-                updateStorageCleanupStatus(pending.file.index, true, storageStatusLabel(status), active = false)
-                Log.i(
-                    tag,
-                    "Pendant file deleted index=${pending.file.index} ok=true status=${storageStatusLabel(status)} alreadyGone=true"
-                )
-                requestStorageFileList(g)
-            }
-            else -> {
-                storageCleanupFailed++
-                updateStorageCleanupStatus(pending.file.index, false, storageStatusLabel(status), active = false)
-                Log.w(tag, "Pendant file deleted index=${pending.file.index} ok=false status=${storageStatusLabel(status)}")
-                requestStorageFileList(g)
-            }
-        }
-    }
-
-    private fun applyDeleteIndexShift(deletedIndex: Int, doneCount: Int) {
-        storageFiles = storageFiles.mapIndexed { pos, file ->
-            if (pos >= doneCount && file.index > deletedIndex) {
-                file.copy(index = file.index - 1)
-            } else {
-                file
-            }
-        }
-    }
-
-    private fun continueAfterStorageFile(g: BluetoothGatt, doneCount: Int) {
-        requestNextStorageFile(g)
     }
 
     private fun emitLiveFrame(frame: ByteArray) {
@@ -1619,11 +1558,6 @@ class OmiBleClient(private val context: Context) {
         if (droppedLiveFrames < 10L || droppedLiveFrames % 100L == 0L) {
             Log.w(tag, "live frame flow full; dropped live frame (#$droppedLiveFrames)")
         }
-    }
-
-    private suspend fun emitStorageFrame(frame: ByteArray) {
-        _frameEvents.emit(AudioFrame(frame, FrameSource.STORAGE))
-        _frames.emit(frame)
     }
 
     private fun completeStorageSync(error: String? = null) {
@@ -1651,13 +1585,11 @@ class OmiBleClient(private val context: Context) {
         )
         pendingStorageSync = false
         storageNotifyEnabled = false
-        currentStorageFile = null
-        currentStorageBytes.reset()
+        ringFrames.clear()
+        ringWindowReset()
+        ringDraining = false
         storageReadGeneration++
-        pendingStorageDelete = null
-        storageFiles = emptyList()
-        completedStorageFileKeys.clear()
-        skippedStorageFileKeys.clear()
+        pendingAdvance = null
         gatt?.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_LOW_POWER)
         disconnect()
         if (shouldRetry) scheduleStorageSyncRetry(error ?: "storage sync retry")
@@ -1669,7 +1601,7 @@ class OmiBleClient(private val context: Context) {
         lastError = error
         pendingStorageSync = false
         storageNotifyEnabled = false
-        pendingStorageDelete = null
+        pendingAdvance = null
         _storageSync.value = current.copy(
             active = false,
             cleanupActive = false,
@@ -1678,12 +1610,11 @@ class OmiBleClient(private val context: Context) {
             lastCompletedAt = System.currentTimeMillis(),
             lastError = error,
         )
-        currentStorageFile = null
-        currentStorageBytes.reset()
+        ringFrames.clear()
+        ringWindowReset()
+        ringDraining = false
         storageReadGeneration++
-        storageFiles = emptyList()
-        completedStorageFileKeys.clear()
-        skippedStorageFileKeys.clear()
+        pendingAdvance = null
         if (isRetryableStorageSyncError(error)) {
             disconnect()
             scheduleStorageSyncRetry(error)
@@ -1692,7 +1623,12 @@ class OmiBleClient(private val context: Context) {
 
     private fun isRetryableStorageSyncError(error: String): Boolean =
         error.contains("STORAGE_NOT_READY", ignoreCase = true) ||
-            error.contains("scan timed out", ignoreCase = true)
+            error.contains("scan timed out", ignoreCase = true) ||
+            // The pendant naps after ~10 s of quiet and a drain link drops every ~10-15 s — both are the
+            // normal cost of draining a RING, so a stalled or dropped window must RETRY, not end the sync.
+            error.contains("stalled", ignoreCase = true) ||
+            error.contains("disconnected during", ignoreCase = true) ||
+            error.contains("no progress", ignoreCase = true)
 
     private fun scheduleStorageSyncRetry(reason: String) {
         val generation = storageRetryGeneration
@@ -1730,11 +1666,22 @@ class OmiBleClient(private val context: Context) {
         Log.w(tag, "Storage stats failed: $error")
     }
 
-    private fun readU32Be(bytes: ByteArray, offset: Int): Long =
-        ((bytes[offset].toLong() and 0xFF) shl 24) or
-            ((bytes[offset + 1].toLong() and 0xFF) shl 16) or
-            ((bytes[offset + 2].toLong() and 0xFF) shl 8) or
-            (bytes[offset + 3].toLong() and 0xFF)
+    // ── big-endian reads (every ring field is big-endian; storage.c uses sys_get_be*()) ─────────────
+    private fun readBe64(bytes: ByteArray, offset: Int): Long {
+        var v = 0L
+        for (i in 0 until 8) v = (v shl 8) or (bytes.getOrElse(offset + i) { 0 }.toLong() and 0xFF)
+        return v
+    }
+
+    private fun readBe32(bytes: ByteArray, offset: Int): Long =
+        ((bytes.getOrElse(offset) { 0 }.toLong() and 0xFF) shl 24) or
+            ((bytes.getOrElse(offset + 1) { 0 }.toLong() and 0xFF) shl 16) or
+            ((bytes.getOrElse(offset + 2) { 0 }.toLong() and 0xFF) shl 8) or
+            (bytes.getOrElse(offset + 3) { 0 }.toLong() and 0xFF)
+
+    private fun readBe16(bytes: ByteArray, offset: Int): Int =
+        ((bytes.getOrElse(offset) { 0 }.toInt() and 0xFF) shl 8) or
+            (bytes.getOrElse(offset + 1) { 0 }.toInt() and 0xFF)
 
     private fun readU32Le(bytes: ByteArray, offset: Int): Long {
         if (offset + 4 > bytes.size) return 0L
@@ -1754,19 +1701,18 @@ class OmiBleClient(private val context: Context) {
     }
 
     private fun storageStatusLabel(status: Int): String = when (status) {
-        STORAGE_OK -> "OK(0)"
-        INVALID_COMMAND -> "INVALID_COMMAND(6)"
-        FILE_NOT_FOUND -> "FILE_ALREADY_GONE_OR_STALE_INDEX(7)"
-        FILE_INDEX_OUT_OF_RANGE -> "FILE_INDEX_OUT_OF_RANGE(8)"
-        STORAGE_NOT_READY -> "STORAGE_NOT_READY(9)"
-        STORAGE_DONE -> "DONE(100)"
+        RingCommands.ACK_OK -> "OK(0)"
+        RingCommands.INVALID_COMMAND -> "INVALID_COMMAND(6)"
+        RingCommands.STORAGE_NOT_READY -> "STORAGE_NOT_READY(9)"
+        RingCommands.SEQ_OUT_OF_RANGE -> "SEQ_OUT_OF_RANGE(10)"
+        RingCommands.RING_ID_MISMATCH -> "RING_ID_MISMATCH(11)"
+        RingCommands.DEFERRED -> "DEFERRED(255)"
         else -> "UNKNOWN($status)"
     }
 
     private fun resetStorageCleanupState() {
         storageCleanupDeleted = 0
         storageCleanupFailed = 0
-        storageDeleteGeneration = 0
     }
 
     private fun updateStorageCleanupStatus(
@@ -1794,28 +1740,19 @@ class OmiBleClient(private val context: Context) {
     }
 
     companion object {
-        private const val CMD_LIST_FILES: Byte = 0x10
-        private const val CMD_READ_FILE: Byte = 0x11
-        private const val CMD_DELETE_FILE: Byte = 0x12
-        private const val STORAGE_OK = 0
-        private const val INVALID_COMMAND = 6
-        private const val FILE_NOT_FOUND = 7
-        private const val FILE_INDEX_OUT_OF_RANGE = 8
-        private const val STORAGE_NOT_READY = 9
-        private const val STORAGE_DONE = 100
-        private const val STORAGE_TIMESTAMP_BYTES = 4
-        private const val MAX_STORAGE_OPUS_PAYLOAD = 127
-        private const val STORAGE_BLOCK_BYTES = 440
-        private const val STORAGE_BLOCK_USABLE_BYTES = STORAGE_BLOCK_BYTES - 1
-        private const val STORAGE_DELETE_TIMEOUT_MS = 30_000L
-        private const val STORAGE_READ_STALL_CHECK_MS = 10_000L
-        private const val STORAGE_READ_STALL_TIMEOUT_MS = 30_000L
-        private const val STORAGE_READ_PROGRESS_LOG_BYTES = 1_048_576
+        // ── the ring — opcodes/statuses live in RingCommands; these are pacing knobs ─────────────────
+        private const val RING_PACKET_BYTES_DEFAULT = 444   // RAW_AUDIO_PACKET_BYTES; INFO's value wins
+        private const val RING_CUSTODY_SETTLE_MS = 600L     // let CUSTODY_ENABLE be processed first
+        private const val STORAGE_READ_STALL_CHECK_MS = 5_000L
+        private const val STORAGE_READ_STALL_TIMEOUT_MS = 20_000L
+        private const val MIN_REASONABLE_EPOCH_SECONDS = 1_500_000_000L
+        private const val MAX_REASONABLE_EPOCH_SECONDS = 4_102_444_800L
         private const val STORAGE_PROOF_WINDOW_MS = 15_000L
         private const val SCAN_TIMEOUT_MS = 60_000L
         private const val DIRECT_CONNECT_TIMEOUT_MS = 20_000L
         private const val STORAGE_RETRY_DELAY_MS = 30_000L
         private const val PREF_LAST_DEVICE_ADDRESS = "last_device_address"
+        private const val PREF_RING_LAST_SEQ = "ring_last_seq"
         private const val MIC_GAIN_MIN = 0
         private const val MIC_GAIN_MAX = 8
         // Firmware level 8 maps to hardware gain byte 0x50, the max PDM gain.

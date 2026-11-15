@@ -58,6 +58,13 @@ jobs:
           ./gradlew --no-daemon assembleRelease
           ./gradlew --no-daemon assembleDebug || true
 
+      - name: Unit tests — the ring command encoders
+        working-directory: android-app
+        run: |
+          # A wrong length is what the firmware answers with ACK status 6 (INVALID_COMMAND), so the byte
+          # lengths are asserted here rather than discovered on a pendant.
+          ./gradlew --no-daemon testDebugUnitTest
+
       - name: Upload the APK
         uses: actions/upload-artifact@v4
         with:

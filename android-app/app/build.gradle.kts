@@ -111,4 +111,7 @@ dependencies {
     implementation(libs.androidx.work.runtime.ktx)
     implementation(libs.play.services.location)
     implementation(libs.androidx.health.connect.client)
+
+    // JVM unit arm for the pure ring-command encoders (asserts the lengths the firmware enforces).
+    testImplementation("junit:junit:4.13.2")
 }
