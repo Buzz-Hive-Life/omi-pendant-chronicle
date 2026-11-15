@@ -1270,8 +1270,16 @@ class OmiBleClient(private val context: Context) {
         // ⚡ CUSTODY FIRST — it is the gate.  storage_connection_changed() CLEARS custody on every
         // connect, so it must be re-sent per session.  Payload is EXACTLY 3 bytes: {opcode, version, caps}.
         Log.i(tag, "Ring: → CUSTODY_ENABLE (0x14) v${RingCommands.CUSTODY_VERSION} caps=0x%02x".format(RingCommands.CUSTODY_CAPS))
-        writeStorageCommand(g, ch, RingCommands.custodyEnable(), failSyncOnError = true) { wrote ->
-            if (!wrote) return@writeStorageCommand
+        // ⚠️⚠️ CUSTODY IS AN OPTIMISATION ON THIS FIRMWARE, NOT A GATE. Measured 2026-11-15: the pendant
+        // answers CUSTODY_ENABLE with `INVALID_COMMAND(6)` (the Debug screen named it in both `BLE err`
+        // and `Sync err`) — and the working reference client (`services/omi-ingest/static/probe.html`)
+        // gets the SAME refusal and drains the ring anyway, because it never treats that ACK as fatal.
+        // This call used to pass `failSyncOnError = true`, so the refusal aborted the whole sync BEFORE
+        // the ring was ever asked for its INFO — which is the shape of "connects, syncs, reads 0 bytes".
+        // ⇒ Ask for custody, take whatever comes back, and proceed: the ring INFO is the only thing the
+        // drain actually needs.
+        writeStorageCommand(g, ch, RingCommands.custodyEnable(), failSyncOnError = false) { wrote ->
+            if (!wrote) Log.w(tag, "Ring: CUSTODY_ENABLE not written — continuing to RING_INFO anyway")
             handler.postDelayed({
                 if (gatt == g && pendingStorageSync) requestRingInfo(g)
             }, RING_CUSTODY_SETTLE_MS)
