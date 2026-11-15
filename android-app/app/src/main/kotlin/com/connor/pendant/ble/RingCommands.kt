@@ -65,8 +65,18 @@ object RingCommands {
     const val ADVANCE_ID_LEN = 17
     const val CUSTODY_LEN = 3
 
-    /** `[0x10]` — 1 byte is a valid RING_INFO. */
-    fun ringInfo(): ByteArray = byteArrayOf(CMD_RING_INFO.toByte())
+    /**
+     * Is this READ payload the 41-byte ring INFO, or the short stats form?
+     *
+     * ⚠️ THE SAME READ HAS TWO ANSWERS. The firmware's status characteristic returns LE u32s
+     * (`used_bytes, unread_packets, free_bytes, rtc_valid` — 16 bytes) to a plain read, and the 41-byte
+     * INFO (BE64 read_seq / BE64 write_seq / …) after a RING_INFO. Feeding the INFO to the stats parser
+     * (or the stats reply to the INFO parser) is a silent zero, not an error — which is exactly how a
+     * correct protocol produced `bytes=0B/0B` on the Debug screen.
+     *
+     * LENGTH is the discriminator: 16 vs 41, unambiguous, and neither can be mistaken for the other.
+     */
+    fun looksLikeInfo(value: ByteArray): Boolean = value.size >= INFO_LEN
 
     /** `[0x13]` — destructive; the collector never sends it. */
     fun ringClear(): ByteArray = byteArrayOf(CMD_RING_CLEAR.toByte())

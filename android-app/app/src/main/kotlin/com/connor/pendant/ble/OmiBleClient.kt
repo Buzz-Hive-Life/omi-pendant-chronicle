@@ -719,7 +719,15 @@ class OmiBleClient(private val context: Context) {
                     Log.i(tag, "Battery: $pct%")
                 }
             } else if (ch.uuid == OmiUuids.STORAGE_READ_CHAR) {
-                handleStorageStatsRead(g, value, status)
+                // Two different payloads arrive on this read: the short stats form (LE u32s) and the
+                // 41-byte ring INFO. Discriminate on LENGTH, which is unambiguous (16 vs 41), and never
+                // let the stats parser eat the INFO — that was the shape of the `bytes=0B/0B` bug.
+                if (RingCommands.looksLikeInfo(value)) {
+                    Log.i(tag, "Ring INFO via READ (${value.size} bytes) — the un-capped path")
+                    handleRingInfo(value)
+                } else {
+                    handleStorageStatsRead(g, value, status)
+                }
             }
         }
 
@@ -1271,9 +1279,24 @@ class OmiBleClient(private val context: Context) {
     }
 
     private fun requestRingInfo(g: BluetoothGatt) {
-        val ch = storageWriteChar(g) ?: return
+        val w = storageWriteChar(g) ?: return
         Log.i(tag, "Ring: → RING_INFO (0x10)")
-        writeStorageCommand(g, ch, RingCommands.ringInfo(), failSyncOnError = true)
+        writeStorageCommand(g, w, RingCommands.ringInfo(), failSyncOnError = true)
+        // ⚠️⚠️ DO NOT rely on the INFO NOTIFY. STORAGE_INFO_LEN is 41 and the firmware's *notify* is
+        // truncated below an ATT MTU of 44 (measured: a 31-byte notify → the size guard fired → read_seq
+        // and write_seq stayed 0 → unread=0 → the Debug screen read `bytes=0B/0B` on a build whose
+        // protocol was otherwise correct). 30295782 is read:true and the READ path is NOT MTU-capped,
+        // so ask for the INFO as a GATT READ as well. The notify, if it arrives whole, is idempotent.
+        requestRingInfoRead(g)
+    }
+
+    /** The un-capped path for the INFO: an explicit READ of the storage characteristic. */
+    private fun requestRingInfoRead(g: BluetoothGatt) {
+        val rd = g.getService(OmiUuids.STORAGE_SERVICE)
+            ?.getCharacteristic(OmiUuids.STORAGE_READ_CHAR) ?: return
+        if (!g.readCharacteristic(rd)) {
+            Log.w(tag, "Ring INFO: READ not accepted; relying on the notify (which may be truncated)")
+        }
     }
 
     /** INFO reply — the 41-byte layout (storage.c:400-409).  This is the ONLY source of the cursor. */
