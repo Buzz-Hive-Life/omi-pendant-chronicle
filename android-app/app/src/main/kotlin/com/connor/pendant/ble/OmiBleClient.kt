@@ -296,6 +296,14 @@ class OmiBleClient(private val context: Context) {
     private var ringPacketIndex = 0L       // records carved in the current window
     private var ringDraining = false
     private var ringCustodyGranted = false
+
+    /**
+     * The opcode of the most recent ring command written.  An ACK carries a STATUS but not the command it
+     * answers, so a REPLY can only be judged against the request if the request is remembered.  Without
+     * this, `INVALID_COMMAND` from a command the firmware is KNOWN to refuse (custody) is indistinguishable
+     * from one that means the drain is broken -- and the app aborted a working drain on the benign one.
+     */
+    private var ringPendingOpcode = 0
     private var ringWindow = ByteArrayOutputStream()
     private val ringFrames = ArrayList<ByteArray>()
     private var pendingAdvance: PendingAdvance? = null
@@ -1209,6 +1217,8 @@ class OmiBleClient(private val context: Context) {
         retryCount: Int = 0,
         onComplete: (Boolean) -> Unit = {}
     ) {
+        // Every ring command passes through here, so this is the one place the outstanding opcode is set.
+        ringPendingOpcode = cmd.first().toInt() and 0xFF
         handler.post {
             if (gatt == null || gatt != g) {
                 Log.w(tag, "Aborting writeStorageCommand: GATT connection changed or null")
@@ -1463,11 +1473,33 @@ class OmiBleClient(private val context: Context) {
             return
         }
         if (status != RingCommands.ACK_OK) {
-            Log.w(tag, "Ring ACK status=${storageStatusLabel(status)}")
-            if (status == RingCommands.INVALID_COMMAND || status == RingCommands.SEQ_OUT_OF_RANGE ||
+            // ⚠️⚠️ THE REPLY IS JUDGED AGAINST THE REQUEST. This firmware does not grant custody, so
+            // CUSTODY_ENABLE (0x14) is answered INVALID_COMMAND(6) on every session -- and the reference
+            // client (static/probe.html) gets the same refusal and drains anyway. Treating that refusal as
+            // fatal aborted the run BEFORE RING_INFO was ever answered, which is the shape of
+            // "connects -> syncs -> bytes=0B/0B" with a clean connection.
+            // NOTE: making the SEND non-fatal is not enough; the handler that receives the REPLY has its
+            // own fatal path. Both arms, or neither.
+            val opcode = ringPendingOpcode
+            val benignCustodyRefusal =
+                opcode == RingCommands.CMD_CUSTODY_ENABLE && status == RingCommands.INVALID_COMMAND
+            if (benignCustodyRefusal) {
+                // Reported as the EXPECTED thing it is, on its own channel -- never in the fault fields,
+                // so `BLE err` / `Sync err` keep meaning "something is wrong".
+                ringCustodyGranted = false
+                Log.i(
+                    tag,
+                    "Ring custody: refused (benign -- this firmware does not grant it; the reference " +
+                        "client sees the same and proceeds). Continuing to RING_INFO."
+                )
+                lastError = null
+            } else if (status == RingCommands.INVALID_COMMAND || status == RingCommands.SEQ_OUT_OF_RANGE ||
                 status == RingCommands.RING_ID_MISMATCH
             ) {
+                Log.w(tag, "Ring ACK status=${storageStatusLabel(status)} for opcode 0x%02x".format(opcode))
                 completeStorageSync("Ring refused a command: ${storageStatusLabel(status)}")
+            } else {
+                Log.w(tag, "Ring ACK status=${storageStatusLabel(status)}")
             }
         }
     }
