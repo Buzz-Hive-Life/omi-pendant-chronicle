@@ -76,6 +76,9 @@ object RingCommands {
      *
      * LENGTH is the discriminator: 16 vs 41, unambiguous, and neither can be mistaken for the other.
      */
+    /** `[0x10]` — 1 byte is a valid RING_INFO. */
+    fun ringInfo(): ByteArray = byteArrayOf(CMD_RING_INFO.toByte())
+
     fun looksLikeInfo(value: ByteArray): Boolean = value.size >= INFO_LEN
 
     /** `[0x13]` — destructive; the collector never sends it. */
