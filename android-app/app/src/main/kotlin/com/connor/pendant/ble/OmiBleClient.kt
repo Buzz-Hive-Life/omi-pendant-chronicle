@@ -1299,13 +1299,24 @@ class OmiBleClient(private val context: Context) {
     private fun requestRingInfo(g: BluetoothGatt) {
         val w = storageWriteChar(g) ?: return
         Log.i(tag, "Ring: → RING_INFO (0x10)")
-        writeStorageCommand(g, w, RingCommands.ringInfo(), failSyncOnError = true)
         // ⚠️⚠️ DO NOT rely on the INFO NOTIFY. STORAGE_INFO_LEN is 41 and the firmware's *notify* is
         // truncated below an ATT MTU of 44 (measured: a 31-byte notify → the size guard fired → read_seq
         // and write_seq stayed 0 → unread=0 → the Debug screen read `bytes=0B/0B` on a build whose
         // protocol was otherwise correct). 30295782 is read:true and the READ path is NOT MTU-capped,
-        // so ask for the INFO as a GATT READ as well. The notify, if it arrives whole, is idempotent.
-        requestRingInfoRead(g)
+        // so ask for the INFO as a GATT READ too. The notify, if it arrives whole, is idempotent.
+        //
+        // ⚠️⚠️ AND THE READ MUST WAIT ITS TURN. Android allows ONE outstanding GATT operation per
+        // connection, and `writeCharacteristicCompat` returns the *acceptance* of a write, not its
+        // *completion* — so issuing the read here (on the line after the write) races the write and
+        // fails with GATT_FAILURE(257), which is exactly the class of error the Debug screen showed in
+        // both `BLE err` and `Sync err`. The working reference client awaits each write before reading;
+        // so does this, via the write's own completion callback rather than a blind sleep.
+        writeStorageCommand(g, w, RingCommands.ringInfo(), failSyncOnError = true) { wrote ->
+            if (!wrote) return@writeStorageCommand
+            handler.postDelayed({
+                if (gatt == g) requestRingInfoRead(g)
+            }, RING_INFO_READ_SETTLE_MS)
+        }
     }
 
     /** The un-capped path for the INFO: an explicit READ of the storage characteristic. */
@@ -1854,6 +1865,9 @@ class OmiBleClient(private val context: Context) {
         // ── the ring — opcodes/statuses live in RingCommands; these are pacing knobs ─────────────────
         private const val RING_PACKET_BYTES_DEFAULT = 444   // RAW_AUDIO_PACKET_BYTES; INFO's value wins
         private const val RING_CUSTODY_SETTLE_MS = 600L     // let CUSTODY_ENABLE be processed first
+    // A GATT READ cannot be issued while a WRITE is still outstanding on the same connection, and the
+    // write API reports acceptance rather than completion -- so the read waits this long behind it.
+    private const val RING_INFO_READ_SETTLE_MS = 250L
         private const val STORAGE_READ_STALL_CHECK_MS = 5_000L
         private const val STORAGE_READ_STALL_TIMEOUT_MS = 20_000L
         private const val MIN_REASONABLE_EPOCH_SECONDS = 1_500_000_000L
