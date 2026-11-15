@@ -1189,6 +1189,54 @@ class OmiBleClient(private val context: Context) {
         Log.i(tag, "Button event ${event.label} raw=$raw bytes=${value.joinToString(" ") { "%02x".format(it) }}")
     }
 
+    /**
+     * Write a ring command to the control characteristic, retrying a transient failure.  A failed write
+     * after 10 attempts is reported through the sync status unless the caller asked it not to be.
+     */
+    private fun writeStorageCommand(
+        g: BluetoothGatt,
+        ch: BluetoothGattCharacteristic,
+        cmd: ByteArray,
+        failSyncOnError: Boolean = true,
+        retryCount: Int = 0,
+        onComplete: (Boolean) -> Unit = {}
+    ) {
+        handler.post {
+            if (gatt == null || gatt != g) {
+                Log.w(tag, "Aborting writeStorageCommand: GATT connection changed or null")
+                onComplete(false)
+                return@post
+            }
+            val success = writeCharacteristicCompat(
+                g,
+                ch,
+                cmd,
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            )
+            if (!success) {
+                if (retryCount < 10) {
+                    Log.w(tag, "Failed to write ring command 0x${cmd.first().toInt().and(0xFF).toString(16)}, retrying (${retryCount + 1}/10)...")
+                    handler.postDelayed({
+                        writeStorageCommand(g, ch, cmd, failSyncOnError, retryCount + 1, onComplete)
+                    }, 100)
+                } else {
+                    val message = "Failed to write ring command 0x${cmd.first().toInt().and(0xFF).toString(16)} after 10 attempts"
+                    if (failSyncOnError) {
+                        completeStorageSync(message)
+                    } else {
+                        Log.w(tag, message)
+                    }
+                    onComplete(false)
+                }
+            } else {
+                onComplete(true)
+            }
+        }
+    }
+
+    private fun storageWriteChar(g: BluetoothGatt): BluetoothGattCharacteristic? =
+        g.getService(OmiUuids.STORAGE_SERVICE)?.getCharacteristic(OmiUuids.STORAGE_WRITE_CHAR)
+
     // ══════════════════════════════════════════════════════════════════════════════════════════════
     //  THE RING — a SEQUENCE drain, not a file list.
     //
