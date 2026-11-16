@@ -32,12 +32,12 @@ android {
         applicationId = "com.connor.pendant"
         minSdk = 31  // Pixel 8 Pro is Android 14+; we don't care about older
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.1.0-hive8-gattseq"
+        versionCode = 7
+        versionName = "0.1.0-hive9-log"
 
         // ⚠️ SHOWN IN THE APP so a screenshot identifies the build. Three APKs went out tonight
         // carrying ONE version string, and neither side could tell which was installed.
-        buildConfigField("String", "HIVE_VERSION", "\"0.1.0-hive8-gattseq\"")
+        buildConfigField("String", "HIVE_VERSION", "\"0.1.0-hive9-log\"")
         buildConfigField(
             "String",
             "AGENT_URL",

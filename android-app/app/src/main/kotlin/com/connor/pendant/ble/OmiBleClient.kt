@@ -73,6 +73,8 @@ class OmiBleClient(private val context: Context) {
         val missingTimestampFiles: Int = 0,
         val lastCompletedAt: Long = 0L,
         val lastError: String? = null,
+        /** The ring conversation, verbatim — the last few events. See [ringNote]. */
+        val ringLog: List<String> = emptyList(),
     )
 
     data class StorageStatsStatus(
@@ -197,6 +199,19 @@ class OmiBleClient(private val context: Context) {
     val micGain: StateFlow<MicGainStatus> = _micGain.asStateFlow()
 
     private val _storageSync = MutableStateFlow(StorageSyncStatus())
+
+    /**
+     * ⚠️ WHY THIS EXISTS: the ring conversation has been diagnosed off photographs of the Debug
+     * screen for several rounds, because the answer lives in `Log.i` — which needs adb — while the
+     * screen shows only the final state. Three separate faults hid behind an identical-looking
+     * `bytes=0B/0B`. This records the last [RING_LOG_MAX] events IN THE STATUS OBJECT the screen
+     * already reads, so one screenshot names the step that stopped.
+     */
+    private fun ringNote(msg: String) {
+        Log.i(tag, "Ring log: $msg")
+        val cur = _storageSync.value
+        _storageSync.value = cur.copy(ringLog = (cur.ringLog + msg).takeLast(RING_LOG_MAX))
+    }
     val storageSync: StateFlow<StorageSyncStatus> = _storageSync.asStateFlow()
 
     private val _storageStats = MutableStateFlow(StorageStatsStatus())
@@ -1298,6 +1313,7 @@ class OmiBleClient(private val context: Context) {
 
     private fun requestRingInfo(g: BluetoothGatt) {
         val w = storageWriteChar(g) ?: return
+        ringNote("→ INFO")
         Log.i(tag, "Ring: → RING_INFO (0x10)")
         // ⚠️⚠️ DO NOT rely on the INFO NOTIFY. STORAGE_INFO_LEN is 41 and the firmware's *notify* is
         // truncated below an ATT MTU of 44 (measured: a 31-byte notify → the size guard fired → read_seq
@@ -1323,7 +1339,10 @@ class OmiBleClient(private val context: Context) {
     private fun requestRingInfoRead(g: BluetoothGatt) {
         val rd = g.getService(OmiUuids.STORAGE_SERVICE)
             ?.getCharacteristic(OmiUuids.STORAGE_READ_CHAR) ?: return
-        if (!g.readCharacteristic(rd)) {
+        if (g.readCharacteristic(rd)) {
+            ringNote("read sent")
+        } else {
+            ringNote("read REJECTED")
             Log.w(tag, "Ring INFO: READ not accepted; relying on the notify (which may be truncated)")
         }
     }
@@ -1331,6 +1350,7 @@ class OmiBleClient(private val context: Context) {
     /** INFO reply — the 41-byte layout (storage.c:400-409).  This is the ONLY source of the cursor. */
     private fun handleRingInfo(value: ByteArray) {
         if (value.size < RingCommands.INFO_LEN) {
+            ringNote("INFO SHORT ${value.size}/${RingCommands.INFO_LEN}")
             Log.w(
                 tag,
                 "Ring INFO short: ${value.size} of ${RingCommands.INFO_LEN} bytes — " +
@@ -1347,6 +1367,7 @@ class OmiBleClient(private val context: Context) {
         ringVersion = value[32].toInt() and 0xFF
         ringId = readBe64(value, 33)
         val unread = (ringWriteSeq - ringReadSeq).coerceAtLeast(0L)
+        ringNote("INFO ok read=${u(ringReadSeq)} write=${u(ringWriteSeq)} unread=$unread")
         Log.i(
             tag,
             "Ring INFO read=${u(ringReadSeq)} write=${u(ringWriteSeq)} unread=$unread cap=${u(ringCapacity)} " +
@@ -1374,6 +1395,7 @@ class OmiBleClient(private val context: Context) {
         lastStorageReadProgressAt = System.currentTimeMillis()
         storageReadGeneration++
         scheduleStorageReadWatchdog(storageReadGeneration)
+        ringNote("→ READ seq=${u(start)}")
         Log.i(tag, "Ring: → RING_READ (0x11) from seq ${u(start)}")
         // ⚠️ From the CURSOR — NEVER a literal 0, and never a 6-byte [index,0,0,0,0] form: the 9-byte
         // length is enforced and a wrong length is the INVALID_COMMAND the old code kept getting.
@@ -1483,6 +1505,7 @@ class OmiBleClient(private val context: Context) {
             pending.onAck(status)
             return
         }
+        ringNote("ACK ${storageStatusLabel(status)} op=0x%02x".format(ringPendingOpcode))
         if (status != RingCommands.ACK_OK) {
             // ⚠️⚠️ THE REPLY IS JUDGED AGAINST THE REQUEST. This firmware does not grant custody, so
             // CUSTODY_ENABLE (0x14) is answered INVALID_COMMAND(6) on every session -- and the reference
@@ -1868,6 +1891,7 @@ class OmiBleClient(private val context: Context) {
     // A GATT READ cannot be issued while a WRITE is still outstanding on the same connection, and the
     // write API reports acceptance rather than completion -- so the read waits this long behind it.
     private const val RING_INFO_READ_SETTLE_MS = 250L
+    private const val RING_LOG_MAX = 8
         private const val STORAGE_READ_STALL_CHECK_MS = 5_000L
         private const val STORAGE_READ_STALL_TIMEOUT_MS = 20_000L
         private const val MIN_REASONABLE_EPOCH_SECONDS = 1_500_000_000L

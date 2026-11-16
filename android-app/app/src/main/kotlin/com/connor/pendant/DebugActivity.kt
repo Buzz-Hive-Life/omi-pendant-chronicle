@@ -120,6 +120,9 @@ class DebugActivity : AppCompatActivity() {
                 .append('/').append(fmtBytes(sync.bytesTotal))
                 .append('\n')
             if (sync.lastError != null) sb.append("Sync err:  ").append(sync.lastError).append('\n')
+            if (sync.ringLog.isNotEmpty()) {
+                sb.append("Ring log:  ").append(sync.ringLog.joinToString("  ·  ")).append('\n')
+            }
         }
         sb.append('\n')
         sb.append("POST url:  ").append(up?.targetUrl ?: "—").append('\n')
