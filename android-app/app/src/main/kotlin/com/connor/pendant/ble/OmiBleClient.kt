@@ -319,6 +319,17 @@ class OmiBleClient(private val context: Context) {
      * from one that means the drain is broken -- and the app aborted a working drain on the benign one.
      */
     private var ringPendingOpcode = 0
+
+    /**
+     * True while a ring write has been accepted but its GATT result has not landed. Android allows ONE
+     * outstanding GATT operation per connection; issuing a second gets rejected, and the symptom is a
+     * write that fails all 10 retries with "Failed to write ring command 0xNN after 10 attempts".
+     */
+    private var ringOpInFlight = false
+
+    /** The pending session watchdog, so the normal path can CANCEL it instead of racing it. */
+    private val ringSessionWatchdog = Runnable { ringSessionWatchdogFire() }
+    private var ringSessionWatchdogArmed = false
     private var ringWindow = ByteArrayOutputStream()
     private val ringFrames = ArrayList<ByteArray>()
     private var pendingAdvance: PendingAdvance? = null
@@ -805,6 +816,7 @@ class OmiBleClient(private val context: Context) {
                 if (chUuid == OmiUuids.STORAGE_WRITE_CHAR) {
                     storageNotifyEnabled = true
                     ringNote("notify ok → session")
+                    cancelRingSessionWatchdog()          // the normal path won; do not also fire
                     Log.i(tag, "Storage notifications enabled")
                     // Subscribing to 30295781 is itself what sets storage_is_on in the firmware — and the
                     // session then opens with CUSTODY_ENABLE, not a file-list request.
@@ -1241,11 +1253,14 @@ class OmiBleClient(private val context: Context) {
         retryCount: Int = 0,
         onComplete: (Boolean) -> Unit = {}
     ) {
-        // Every ring command passes through here, so this is the one place the outstanding opcode is set.
+        // Every ring command passes through here, so this is the one place the outstanding opcode and the
+        // in-flight guard are maintained.
         ringPendingOpcode = cmd.first().toInt() and 0xFF
+        ringOpInFlight = true
         handler.post {
             if (gatt == null || gatt != g) {
                 Log.w(tag, "Aborting writeStorageCommand: GATT connection changed or null")
+                ringOpInFlight = false
                 onComplete(false)
                 return@post
             }
@@ -1268,9 +1283,11 @@ class OmiBleClient(private val context: Context) {
                     } else {
                         Log.w(tag, message)
                     }
+                    ringOpInFlight = false
                     onComplete(false)
                 }
             } else {
+                ringOpInFlight = false
                 onComplete(true)
             }
         }
@@ -1325,12 +1342,35 @@ class OmiBleClient(private val context: Context) {
      * Reports which path was taken, so a non-firing callback is visible rather than silent.
      */
     private fun armRingSessionWatchdog(g: BluetoothGatt) {
-        handler.postDelayed({
-            if (gatt != g || !pendingStorageSync) return@postDelayed
-            if (ringReadSeq >= 0L || ringFrames.isNotEmpty()) return@postDelayed   // a session is already up
-            ringNote("session watchdog → opening")
-            startRingSession(g)
-        }, RING_SESSION_WATCHDOG_MS)
+        cancelRingSessionWatchdog()
+        ringSessionWatchdogArmed = true
+        handler.postDelayed(ringSessionWatchdog, RING_SESSION_WATCHDOG_MS)
+    }
+
+    /** Called the moment the normal path opens a session — the watchdog's job is then done. */
+    private fun cancelRingSessionWatchdog() {
+        if (ringSessionWatchdogArmed) {
+            handler.removeCallbacks(ringSessionWatchdog)
+            ringSessionWatchdogArmed = false
+        }
+    }
+
+    private fun ringSessionWatchdogFire() {
+        ringSessionWatchdogArmed = false
+        val g = gatt ?: return
+        if (!pendingStorageSync) return
+        if (ringReadSeq >= 0L || ringFrames.isNotEmpty()) return      // a session is already up
+        // ⚠️⚠️ AND NEVER WHILE AN OPERATION IS OUTSTANDING. Re-opening a session on top of an
+        // in-flight read/write makes the NEW write collide, and the visible symptom is not "two
+        // sessions" — it is "Failed to write ring command 0x10 after 10 attempts", which reads as a
+        // write fault when it is really a concurrency fault. Re-arm and try again instead.
+        if (ringOpInFlight) {
+            ringNote("watchdog deferred (op in flight)")
+            armRingSessionWatchdog(g)
+            return
+        }
+        ringNote("session watchdog → opening")
+        startRingSession(g)
     }
 
     private fun requestRingInfo(g: BluetoothGatt) {
@@ -1527,6 +1567,7 @@ class OmiBleClient(private val context: Context) {
             pending.onAck(status)
             return
         }
+        ringOpInFlight = false
         ringNote("ACK ${storageStatusLabel(status)} op=0x%02x".format(ringPendingOpcode))
         if (status != RingCommands.ACK_OK) {
             // ⚠️⚠️ THE REPLY IS JUDGED AGAINST THE REQUEST. This firmware does not grant custody, so
