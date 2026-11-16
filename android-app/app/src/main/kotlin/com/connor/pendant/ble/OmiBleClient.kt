@@ -804,6 +804,7 @@ class OmiBleClient(private val context: Context) {
                 }
                 if (chUuid == OmiUuids.STORAGE_WRITE_CHAR) {
                     storageNotifyEnabled = true
+                    ringNote("notify ok → session")
                     Log.i(tag, "Storage notifications enabled")
                     // Subscribing to 30295781 is itself what sets storage_is_on in the firmware — and the
                     // session then opens with CUSTODY_ENABLE, not a file-list request.
@@ -1103,7 +1104,15 @@ class OmiBleClient(private val context: Context) {
         pendingStorageSync = true
         _state.value = State.SYNCING
         resetStorageCleanupState()
+        // NOTE: this deliberately WIPES the ring log for the new session -- it is a fresh conversation.
         _storageSync.value = StorageSyncStatus(active = true)
+        // ⚠️⚠️ THE SESSION MUST NOT HANG OFF ONE CALLBACK. The ring session is opened from the CCC
+        // descriptor-write callback for STORAGE_WRITE_CHAR, and the disconnect handler clears
+        // notifyQueue / notifyEnabled / notifyWriteInFlight, so an interrupted enable is never
+        // retried -- the session then never opens at all: no INFO, no cursor, no error, and a
+        // Debug screen reading `bytes=0B/0B` with an empty error field. Observed exactly that.
+        // This watchdog opens the session anyway if notifications are up but nothing has started.
+        armRingSessionWatchdog(g)
         ringFrames.clear()
         ringWindowReset()
         ringDraining = false
@@ -1309,6 +1318,19 @@ class OmiBleClient(private val context: Context) {
                 if (gatt == g && pendingStorageSync) requestRingInfo(g)
             }, RING_CUSTODY_SETTLE_MS)
         }
+    }
+
+    /**
+     * If the CCC callback that normally opens the ring session never fires, open it here instead.
+     * Reports which path was taken, so a non-firing callback is visible rather than silent.
+     */
+    private fun armRingSessionWatchdog(g: BluetoothGatt) {
+        handler.postDelayed({
+            if (gatt != g || !pendingStorageSync) return@postDelayed
+            if (ringReadSeq >= 0L || ringFrames.isNotEmpty()) return@postDelayed   // a session is already up
+            ringNote("session watchdog → opening")
+            startRingSession(g)
+        }, RING_SESSION_WATCHDOG_MS)
     }
 
     private fun requestRingInfo(g: BluetoothGatt) {
@@ -1892,6 +1914,8 @@ class OmiBleClient(private val context: Context) {
     // write API reports acceptance rather than completion -- so the read waits this long behind it.
     private const val RING_INFO_READ_SETTLE_MS = 250L
     private const val RING_LOG_MAX = 8
+    // Longer than a CCC write should take, shorter than the pendant's ~10-15 s window.
+    private const val RING_SESSION_WATCHDOG_MS = 2500L
         private const val STORAGE_READ_STALL_CHECK_MS = 5_000L
         private const val STORAGE_READ_STALL_TIMEOUT_MS = 20_000L
         private const val MIN_REASONABLE_EPOCH_SECONDS = 1_500_000_000L
