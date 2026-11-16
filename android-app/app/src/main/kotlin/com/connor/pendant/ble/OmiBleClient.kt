@@ -327,6 +327,17 @@ class OmiBleClient(private val context: Context) {
      */
     private var ringOpInFlight = false
 
+    /**
+     * ⚠️⚠️ CUSTODY -> INFO IS A WAIT FOR THE ACK, NOT A TIMER. The gap used to be a fixed
+     * 600 ms delay, which cannot keep only one command outstanding -- and one-command-outstanding is
+     * the only thing that makes the ACK's attributed `op=` mean anything. A custody refusal landing
+     * later than the timer was therefore logged under INFO's opcode: an ACK carries a STATUS but NOT
+     * the command it answers, so the reply can only be judged against the request if the request is
+     * not already superseded. (Caught by Astro-Bee reading this logger, 2026-11-16.)
+     */
+    private var awaitingCustodyAck = false
+    private val custodyAckFallback = Runnable { ringCustodyResolved("fallback — no ACK") }
+
     /** The pending session watchdog, so the normal path can CANCEL it instead of racing it. */
     private val ringSessionWatchdog = Runnable { ringSessionWatchdogFire() }
     private var ringSessionWatchdogArmed = false
@@ -1329,11 +1340,14 @@ class OmiBleClient(private val context: Context) {
         // the ring was ever asked for its INFO — which is the shape of "connects, syncs, reads 0 bytes".
         // ⇒ Ask for custody, take whatever comes back, and proceed: the ring INFO is the only thing the
         // drain actually needs.
+        awaitingCustodyAck = true
+        handler.removeCallbacks(custodyAckFallback)
+        handler.postDelayed(custodyAckFallback, RING_CUSTODY_ACK_FALLBACK_MS)
         writeStorageCommand(g, ch, RingCommands.custodyEnable(), failSyncOnError = false) { wrote ->
-            if (!wrote) Log.w(tag, "Ring: CUSTODY_ENABLE not written — continuing to RING_INFO anyway")
-            handler.postDelayed({
-                if (gatt == g && pendingStorageSync) requestRingInfo(g)
-            }, RING_CUSTODY_SETTLE_MS)
+            if (!wrote) {
+                Log.w(tag, "Ring: CUSTODY_ENABLE not written — continuing to RING_INFO anyway")
+                ringCustodyResolved("not written")
+            }
         }
     }
 
@@ -1371,6 +1385,20 @@ class OmiBleClient(private val context: Context) {
         }
         ringNote("session watchdog → opening")
         startRingSession(g)
+    }
+
+    /**
+     * Custody's business is finished -- whether by its ACK or by the fallback. Proceed to RING_INFO
+     * exactly ONCE, so the gap is a completion rather than a guess.
+     */
+    private fun ringCustodyResolved(why: String) {
+        if (!awaitingCustodyAck) return
+        awaitingCustodyAck = false
+        handler.removeCallbacks(custodyAckFallback)
+        val g = gatt ?: return
+        if (!pendingStorageSync) return
+        ringNote("custody resolved ($why) → INFO")
+        requestRingInfo(g)
     }
 
     private fun requestRingInfo(g: BluetoothGatt) {
@@ -1569,6 +1597,12 @@ class OmiBleClient(private val context: Context) {
         }
         ringOpInFlight = false
         ringNote("ACK ${storageStatusLabel(status)} op=0x%02x".format(ringPendingOpcode))
+        // ⚠️ WHILE CUSTODY IS PENDING, AN ACK IS CUSTODY'S -- whatever recency would attribute it to.
+        // That is what makes this attribution true instead of a guess.
+        if (awaitingCustodyAck) {
+            ringCustodyResolved("ACK ${storageStatusLabel(status)}")
+            return
+        }
         if (status != RingCommands.ACK_OK) {
             // ⚠️⚠️ THE REPLY IS JUDGED AGAINST THE REQUEST. This firmware does not grant custody, so
             // CUSTODY_ENABLE (0x14) is answered INVALID_COMMAND(6) on every session -- and the reference
@@ -1950,7 +1984,8 @@ class OmiBleClient(private val context: Context) {
     companion object {
         // ── the ring — opcodes/statuses live in RingCommands; these are pacing knobs ─────────────────
         private const val RING_PACKET_BYTES_DEFAULT = 444   // RAW_AUDIO_PACKET_BYTES; INFO's value wins
-        private const val RING_CUSTODY_SETTLE_MS = 600L     // let CUSTODY_ENABLE be processed first
+        // FALLBACK ONLY. Custody advances on its ACK; this fires solely if no ACK arrives at all.
+    private const val RING_CUSTODY_ACK_FALLBACK_MS = 1500L
     // A GATT READ cannot be issued while a WRITE is still outstanding on the same connection, and the
     // write API reports acceptance rather than completion -- so the read waits this long behind it.
     private const val RING_INFO_READ_SETTLE_MS = 250L
